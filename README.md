@@ -34,10 +34,9 @@ Both ETLs need API tokens. You can provide them via **environment variables** (r
 
 ### GitHub Token
 
-1. Go to [github.com/settings/tokens](https://github.com/settings/tokens)
-2. Click **Generate new token (classic)**
-3. Select scopes: `repo` (full control of private repos) — or `public_repo` if your repos are public
-4. Copy the token
+1. Go to [Personal Access Tokens (Fine-grained)](https://github.com/settings/personal-access-tokens)
+2. Click **Generate new token**, select the repos you need, and grant **Pull requests** → Read-only permission (plus **Contents** → Read-only if your repos are private)
+3. Copy the token
 
 **Option A — Environment variable** (recommended):
 ```bash
