@@ -45,20 +45,26 @@ AI_COLORS = {
 @st.cache_data(ttl=300)
 def load_prs():
     conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query(
-        """
-        SELECT
-            pr_key, pr_number, repo_key, author_login, team_name, title,
-            state, is_draft, created_at, merged_at, closed_at,
-            hours_to_first_review, hours_to_first_approval, hours_to_merge,
-            review_comment_count, issue_comment_count, total_comment_count,
-            files_changed, lines_added, lines_removed, total_lines_changed,
-            has_ai_coauthor, ai_coauthor_tools, review_status
-        FROM fact_pr
-        """,
-        conn,
-    )
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT
+                pr_key, pr_number, repo_key, author_login, team_name, title,
+                state, is_draft, created_at, merged_at, closed_at,
+                hours_to_first_review, hours_to_first_approval, hours_to_merge,
+                review_comment_count, issue_comment_count, total_comment_count,
+                files_changed, lines_added, lines_removed, total_lines_changed,
+                has_ai_coauthor, ai_coauthor_tools, review_status
+            FROM fact_pr
+            """,
+            conn,
+        )
+    except (pd.io.sql.DatabaseError, sqlite3.OperationalError):
+        conn.close()
+        return pd.DataFrame()
     conn.close()
+    if df.empty:
+        return df
     df["created_date"] = pd.to_datetime(df["created_at"]).dt.date
     df["merged_date"] = pd.to_datetime(df["merged_at"]).dt.date
     return df
@@ -68,34 +74,38 @@ def load_prs():
 def load_task_cycle_times():
     """Load per-Jira-issue cycle time data joined with PR timing."""
     conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query(
-        """
-        SELECT
-            j.issue_key,
-            j.issue_type,
-            j.status,
-            j.story_points,
-            j.sprint_name,
-            j.project_key,
-            j.assignee_display_name,
-            MAX(p.has_ai_coauthor) AS has_ai,
-            p.team_name,
-            j.in_progress_at,
-            MIN(p.created_at) AS first_pr_created,
-            MAX(p.merged_at) AS last_pr_merged,
-            j.done_at,
-            COUNT(DISTINCT p.pr_key) AS pr_count
-        FROM fact_pr p
-        JOIN bridge_pr_jira b ON p.pr_key = b.pr_key
-        JOIN dim_jira_issue j ON b.jira_key = j.issue_key
-        WHERE p.team_name IS NOT NULL
-            AND p.state = 'merged'
-            AND j.in_progress_at IS NOT NULL
-            AND j.done_at IS NOT NULL
-        GROUP BY j.issue_key
-        """,
-        conn,
-    )
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT
+                j.issue_key,
+                j.issue_type,
+                j.status,
+                j.story_points,
+                j.sprint_name,
+                j.project_key,
+                j.assignee_display_name,
+                MAX(p.has_ai_coauthor) AS has_ai,
+                p.team_name,
+                j.in_progress_at,
+                MIN(p.created_at) AS first_pr_created,
+                MAX(p.merged_at) AS last_pr_merged,
+                j.done_at,
+                COUNT(DISTINCT p.pr_key) AS pr_count
+            FROM fact_pr p
+            JOIN bridge_pr_jira b ON p.pr_key = b.pr_key
+            JOIN dim_jira_issue j ON b.jira_key = j.issue_key
+            WHERE p.team_name IS NOT NULL
+                AND p.state = 'merged'
+                AND j.in_progress_at IS NOT NULL
+                AND j.done_at IS NOT NULL
+            GROUP BY j.issue_key
+            """,
+            conn,
+        )
+    except (pd.io.sql.DatabaseError, sqlite3.OperationalError):
+        conn.close()
+        return pd.DataFrame()
     conn.close()
 
     if df.empty:
@@ -134,24 +144,30 @@ def load_task_cycle_times():
 @st.cache_data(ttl=300)
 def load_reviews():
     conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query(
-        """
-        SELECT
-            r.review_key, r.pr_key, r.reviewer_login, r.review_state,
-            r.submitted_at, a.team_name AS reviewer_team,
-            p.files_changed, p.lines_added, p.lines_removed,
-            p.total_lines_changed,
-            p.author_login AS pr_author,
-            pa.team_name AS pr_author_team,
-            pa.is_tracked AS pr_author_is_tracked
-        FROM dim_review r
-        LEFT JOIN dim_author a ON r.reviewer_login = a.author_login
-        LEFT JOIN fact_pr p ON r.pr_key = p.pr_key
-        LEFT JOIN dim_author pa ON p.author_login = pa.author_login
-        """,
-        conn,
-    )
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT
+                r.review_key, r.pr_key, r.reviewer_login, r.review_state,
+                r.submitted_at, a.team_name AS reviewer_team,
+                p.files_changed, p.lines_added, p.lines_removed,
+                p.total_lines_changed,
+                p.author_login AS pr_author,
+                pa.team_name AS pr_author_team,
+                pa.is_tracked AS pr_author_is_tracked
+            FROM dim_review r
+            LEFT JOIN dim_author a ON r.reviewer_login = a.author_login
+            LEFT JOIN fact_pr p ON r.pr_key = p.pr_key
+            LEFT JOIN dim_author pa ON p.author_login = pa.author_login
+            """,
+            conn,
+        )
+    except (pd.io.sql.DatabaseError, sqlite3.OperationalError):
+        conn.close()
+        return pd.DataFrame()
     conn.close()
+    if df.empty:
+        return df
     df["review_date"] = pd.to_datetime(df["submitted_at"]).dt.date
     return df
 
@@ -244,9 +260,13 @@ def main():
 
     # Show last ETL run times
     conn = sqlite3.connect(DB_PATH)
-    gh_row = conn.execute(
-        "SELECT last_run_at FROM etl_watermark WHERE pipeline_name = 'github_pr_etl'"
-    ).fetchone()
+    gh_row = None
+    try:
+        gh_row = conn.execute(
+            "SELECT last_run_at FROM etl_watermark WHERE pipeline_name = 'github_pr_etl'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        pass  # GitHub ETL hasn't run yet — table doesn't exist
     jira_row = None
     try:
         jira_row = conn.execute(
@@ -298,13 +318,20 @@ def main():
 
     # ── Filter data ─────────────────────────────────────────────────────────
 
-    team_prs = prs[prs["team_name"].isin(selected_teams)]
-    team_prs_ranged = filter_by_date(team_prs, "created_date", start_date, end_date)
+    if prs.empty and reviews.empty:
+        st.info(
+            "No data yet. Run the GitHub ETL to populate PR data:\n\n"
+            "```\npython3 github_etl.py --since 2025-01-01\n```"
+        )
+        return
 
-    team_reviews = reviews[reviews["reviewer_team"].isin(selected_teams)]
+    team_prs = prs[prs["team_name"].isin(selected_teams)] if not prs.empty else prs
+    team_prs_ranged = filter_by_date(team_prs, "created_date", start_date, end_date) if not prs.empty else prs
+
+    team_reviews = reviews[reviews["reviewer_team"].isin(selected_teams)] if not reviews.empty else reviews
     team_reviews_ranged = filter_by_date(
         team_reviews, "review_date", start_date, end_date
-    )
+    ) if not reviews.empty else reviews
 
     # ── KPIs ────────────────────────────────────────────────────────────────
 
