@@ -25,7 +25,7 @@ python3 jira_etl.py                # Fetch Jira issue data
 python3 jira_etl.py --backfill     # Link Jira issues to PRs
 
 # 5. Start the dashboard
-streamlit run dashboard.py
+streamlit run dashboard.py --server.headless true
 ```
 
 ## Authentication
