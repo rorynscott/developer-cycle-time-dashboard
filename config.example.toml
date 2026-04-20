@@ -1,0 +1,69 @@
+# Developer Cycle Time Dashboard — Configuration
+# Copy to config.toml and edit for your org:
+#   cp config.example.toml config.toml
+
+# ── GitHub ─────────────────────────────────────────────────────────────────
+
+[github]
+# Repos to track (org/repo format)
+repos = [
+    "my-org/my-repo",
+]
+# Auth: set GITHUB_TOKEN env var, or provide a file path here
+# token_path = "~/.github_pat"
+
+# ── Jira ───────────────────────────────────────────────────────────────────
+
+[jira]
+base_url = "https://your-org.atlassian.net"
+email = "you@example.com"
+# Auth: set JIRA_TOKEN env var, or provide a file path here
+# token_path = "~/.atlassian_token"
+
+# Jira projects to pull issues from
+projects = ["PROJ1", "PROJ2"]
+
+[jira.custom_fields]
+# Map logical names to your Jira instance's custom field IDs.
+# story_points and sprint are used by the dashboard; others are stored as-is.
+story_points = "customfield_10028"
+sprint = "customfield_10020"
+# Add any extra fields you want captured:
+# aha_url = "customfield_11729"
+
+[jira.status_categories]
+# Which Jira status names count as "in progress" and "done" for cycle time
+in_progress = ["In Progress", "In Development"]
+done = ["Done", "Closed", "Resolved"]
+
+# ── Database ───────────────────────────────────────────────────────────────
+
+[database]
+# Path to SQLite DB (relative to project root or absolute)
+path = "data/cycle_time.db"
+
+# ── Teams ──────────────────────────────────────────────────────────────────
+# Add one [[teams]] block per team. Members are GitHub usernames.
+
+[[teams]]
+name = "My Team"
+short_name = "MyTeam"             # Dashboard labels (optional, defaults to first word of name)
+color = "#636EFA"                 # Chart color (optional, auto-assigned if omitted)
+members = [
+    "github-user-1",
+    "github-user-2",
+]
+
+[[teams]]
+name = "Other Team"
+short_name = "Other"
+color = "#EF553B"
+members = [
+    "github-user-3",
+]
+
+# ── Dashboard (optional) ──────────────────────────────────────────────────
+
+[dashboard]
+title = "Developer Cycle Time Dashboard"
+default_days = 30                 # Default date range on load
