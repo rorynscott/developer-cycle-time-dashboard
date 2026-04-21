@@ -15,7 +15,8 @@ mkdir -p "$LOG_DIR"
 
 echo "===== $(date -u '+%Y-%m-%d %H:%M:%S UTC') =====" >> "$LOG_FILE"
 
-python3 "$PROJECT_DIR/jira_etl.py" >> "$LOG_FILE" 2>&1
+PYTHON="${PYTHON:-$(command -v python3)}"
+"$PYTHON" "$PROJECT_DIR/jira_etl.py" >> "$LOG_FILE" 2>&1
 EXIT_CODE=$?
 
 if [ $EXIT_CODE -ne 0 ]; then
