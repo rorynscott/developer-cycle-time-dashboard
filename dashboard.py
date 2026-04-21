@@ -333,385 +333,392 @@ def main():
         team_reviews, "review_date", start_date, end_date
     ) if not reviews.empty else reviews
 
-    # ── KPIs ────────────────────────────────────────────────────────────────
+    # ── Tabs ───────────────────────────────────────────────────────────────
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("PRs Created", len(team_prs_ranged))
-    c2.metric("Reviews Submitted", len(team_reviews_ranged))
-    merged = team_prs_ranged[team_prs_ranged["state"] == "merged"]
-    avg_merge_hrs = merged["hours_to_merge"].dropna().mean()
-    c3.metric("Avg Hours to Merge", f"{avg_merge_hrs:.1f}" if pd.notna(avg_merge_hrs) else "—")
-    ai_pct = (
-        team_prs_ranged["has_ai_coauthor"].sum() / len(team_prs_ranged) * 100
-        if len(team_prs_ranged) > 0 else 0
-    )
-    c4.metric("AI Co-authored", f"{ai_pct:.0f}%")
-
-    # ── Section 1: PRs Created ──────────────────────────────────────────────
-
-    st.header("PRs Created")
-    st.plotly_chart(
-        daily_bar_chart(
-            team_prs_ranged, "created_date", color_col,
-            "PRs Created by Day",
-        ),
-        use_container_width=True,
+    tab_overview, tab_reviews, tab_pr_size, tab_cycle_time = st.tabs(
+        ["Overview", "Reviews", "PR Size", "Cycle Time"]
     )
 
-    # ── Section 1b: AI Co-authoring ───────────────────────────────────────────
+    # ── Overview tab ───────────────────────────────────────────────────────
 
-    st.header("AI Co-authoring")
-    ai_prs = team_prs_ranged.copy()
-    ai_prs["authoring"] = ai_prs["has_ai_coauthor"].map(
-        {1: "Human + AI", 0: "Human Only", True: "Human + AI", False: "Human Only"}
-    )
-    st.plotly_chart(
-        daily_bar_chart(
-            ai_prs, "created_date", "authoring",
-            "PRs by Authoring Method",
-        ),
-        use_container_width=True,
-    )
+    with tab_overview:
 
-    # ── Section 2: PRs Reviewed ─────────────────────────────────────────────
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("PRs Created", len(team_prs_ranged))
+        c2.metric("Reviews Submitted", len(team_reviews_ranged))
+        merged = team_prs_ranged[team_prs_ranged["state"] == "merged"]
+        avg_merge_hrs = merged["hours_to_merge"].dropna().mean()
+        c3.metric("Avg Hours to Merge", f"{avg_merge_hrs:.1f}" if pd.notna(avg_merge_hrs) else "—")
+        ai_pct = (
+            team_prs_ranged["has_ai_coauthor"].sum() / len(team_prs_ranged) * 100
+            if len(team_prs_ranged) > 0 else 0
+        )
+        c4.metric("AI Co-authored", f"{ai_pct:.0f}%")
 
-    st.header("Reviews Submitted")
-    st.plotly_chart(
-        daily_bar_chart(
-            team_reviews_ranged, "review_date", review_color_col,
-            "Reviews Submitted by Day",
-        ),
-        use_container_width=True,
-    )
-
-    # ── Section 2b: Review Burden by Origin ──────────────────────────────────
-
-    st.header("Review Burden by Origin")
-    st.caption(
-        "All reviews submitted by your teams, grouped by the PR author's team. "
-        '"Other" = authors outside your configured teams.'
-    )
-
-    origin_reviews = team_reviews_ranged.copy()
-    # Map PR author's team to short name; everything else is "Other"
-    origin_reviews["review_origin"] = origin_reviews["pr_author_team"].map(
-        _TEAM_SHORT_NAMES
-    ).fillna("Other")
-
-    # Build color map from config team colors + orange for Other
-    origin_color_map = {
-        _TEAM_SHORT_NAMES[t["name"]]: t["color"] for t in get_teams()
-    }
-    origin_color_map["Other"] = "#FFA15A"
-
-    # Category order: teams in config order, then Other
-    origin_order = [t["short_name"] for t in get_teams()] + ["Other"]
-    origin_reviews["review_origin"] = pd.Categorical(
-        origin_reviews["review_origin"],
-        categories=origin_order,
-        ordered=True,
-    )
-
-    origin_daily = (
-        origin_reviews.groupby(["review_date", "review_origin"])
-        .size()
-        .reset_index(name="count")
-    )
-    fig_origin = px.bar(
-        origin_daily,
-        x="review_date",
-        y="count",
-        color="review_origin",
-        color_discrete_map=origin_color_map,
-        title="Reviews by PR Author Origin",
-        labels={"review_date": "Date", "count": "Reviews", "review_origin": ""},
-        barmode="stack",
-        category_orders={"review_origin": origin_order},
-    )
-
-    # Add % Other trend line (7-day rolling)
-    total_daily = origin_reviews.groupby("review_date").size()
-    other_daily = (
-        origin_reviews[origin_reviews["review_origin"] == "Other"]
-        .groupby("review_date").size()
-    )
-    pct_other = (other_daily / total_daily * 100).rolling(7, min_periods=1).mean()
-    pct_other = pct_other.dropna().reset_index()
-    pct_other.columns = ["review_date", "pct"]
-    if len(pct_other) >= 2:
-        fig_origin.add_trace(go.Scatter(
-            x=pct_other["review_date"],
-            y=pct_other["pct"],
-            mode="lines",
-            name="% Other (7d avg)",
-            line=dict(color="#FFA15A", width=2, dash="dash"),
-            yaxis="y2",
-            hovertemplate="%{y:.0f}%<extra>% Other</extra>",
-        ))
-        fig_origin.update_layout(
-            yaxis2=dict(
-                title="% Other",
-                overlaying="y",
-                side="right",
-                range=[0, 100],
-                showgrid=False,
+        st.header("PRs Created")
+        st.plotly_chart(
+            daily_bar_chart(
+                team_prs_ranged, "created_date", color_col,
+                "PRs Created by Day",
             ),
+            use_container_width=True,
         )
 
-    fig_origin.update_layout(
-        xaxis_tickformat="%b %d",
-        legend=dict(orientation="h", y=-0.15),
-    )
-    st.plotly_chart(fig_origin, use_container_width=True)
+        st.header("AI Co-authoring")
+        ai_prs = team_prs_ranged.copy()
+        ai_prs["authoring"] = ai_prs["has_ai_coauthor"].map(
+            {1: "Human + AI", 0: "Human Only", True: "Human + AI", False: "Human Only"}
+        )
+        st.plotly_chart(
+            daily_bar_chart(
+                ai_prs, "created_date", "authoring",
+                "PRs by Authoring Method",
+            ),
+            use_container_width=True,
+        )
 
-    # Summary metrics
-    total = len(origin_reviews)
-    if total > 0:
-        counts = origin_reviews["review_origin"].value_counts()
-        other_count = counts.get("Other", 0)
-        oc1, oc2, oc3 = st.columns(3)
-        oc1.metric("Total Reviews", total)
-        oc2.metric("External (Other)", f"{other_count} ({other_count / total * 100:.0f}%)")
-        oc3.metric("Internal", f"{total - other_count} ({(total - other_count) / total * 100:.0f}%)")
+    # ── Reviews tab ────────────────────────────────────────────────────────
 
-    # ── Section 2c: Who Are We Reviewing? ─────────────────────────────────
+    with tab_reviews:
 
-    st.header("Who Are We Reviewing?")
-    st.caption("PR authors outside your teams whose PRs your teams reviewed")
+        st.header("Reviews Submitted")
+        st.plotly_chart(
+            daily_bar_chart(
+                team_reviews_ranged, "review_date", review_color_col,
+                "Reviews Submitted by Day",
+            ),
+            use_container_width=True,
+        )
 
-    all_team_members = set()
-    for t in TEAMS:
-        all_team_members.update(prs[prs["team_name"] == t]["author_login"].unique())
+        st.header("Review Burden by Origin")
+        st.caption(
+            "All reviews submitted by your teams, grouped by the PR author's team. "
+            '"Other" = authors outside your configured teams.'
+        )
 
-    external_reviews = team_reviews_ranged[
-        ~team_reviews_ranged["pr_author"].isin(all_team_members)
-    ].copy()
+        origin_reviews = team_reviews_ranged.copy()
+        # Map PR author's team to short name; everything else is "Other"
+        origin_reviews["review_origin"] = origin_reviews["pr_author_team"].map(
+            _TEAM_SHORT_NAMES
+        ).fillna("Other")
 
-    if len(external_reviews) > 0:
-        ext_by_author = (
-            external_reviews
-            .groupby("pr_author")
-            .agg(
-                reviews=("review_key", "count"),
-                unique_prs=("pr_key", "nunique"),
+        # Build color map from config team colors + orange for Other
+        origin_color_map = {
+            _TEAM_SHORT_NAMES[t["name"]]: t["color"] for t in get_teams()
+        }
+        origin_color_map["Other"] = "#FFA15A"
+
+        # Category order: teams in config order, then Other
+        origin_order = [t["short_name"] for t in get_teams()] + ["Other"]
+        origin_reviews["review_origin"] = pd.Categorical(
+            origin_reviews["review_origin"],
+            categories=origin_order,
+            ordered=True,
+        )
+
+        origin_daily = (
+            origin_reviews.groupby(["review_date", "review_origin"])
+            .size()
+            .reset_index(name="count")
+        )
+        fig_origin = px.bar(
+            origin_daily,
+            x="review_date",
+            y="count",
+            color="review_origin",
+            color_discrete_map=origin_color_map,
+            title="Reviews by PR Author Origin",
+            labels={"review_date": "Date", "count": "Reviews", "review_origin": ""},
+            barmode="stack",
+            category_orders={"review_origin": origin_order},
+        )
+
+        # Add % Other regression line
+        total_daily = origin_reviews.groupby("review_date").size()
+        other_daily = (
+            origin_reviews[origin_reviews["review_origin"] == "Other"]
+            .groupby("review_date").size()
+        )
+        pct_other = (other_daily / total_daily * 100).dropna().reset_index()
+        pct_other.columns = ["review_date", "pct"]
+        pct_other = pct_other.sort_values("review_date")
+        if len(pct_other) >= 2:
+            x_num = (pd.to_datetime(pct_other["review_date"]) - pd.to_datetime(pct_other["review_date"].iloc[0])).dt.days.values.astype(float)
+            coeffs = np.polyfit(x_num, pct_other["pct"].values, 1)
+            trend_y = np.polyval(coeffs, x_num)
+            fig_origin.add_trace(go.Scatter(
+                x=pct_other["review_date"],
+                y=trend_y,
+                mode="lines",
+                name="% Other (trend)",
+                line=dict(color="#FFA15A", width=2, dash="dash"),
+                yaxis="y2",
+                hovertemplate="%{y:.1f}%<extra>% Other trend</extra>",
+            ))
+            fig_origin.update_layout(
+                yaxis2=dict(
+                    title="% Other",
+                    overlaying="y",
+                    side="right",
+                    range=[0, 100],
+                    showgrid=False,
+                ),
             )
-            .reset_index()
-            .sort_values("reviews", ascending=False)
+
+        fig_origin.update_layout(
+            xaxis_tickformat="%b %d",
+            legend=dict(orientation="h", y=-0.15),
+        )
+        st.plotly_chart(fig_origin, use_container_width=True)
+
+        # Summary metrics
+        total = len(origin_reviews)
+        if total > 0:
+            counts = origin_reviews["review_origin"].value_counts()
+            other_count = counts.get("Other", 0)
+            oc1, oc2, oc3 = st.columns(3)
+            oc1.metric("Total Reviews", total)
+            oc2.metric("External (Other)", f"{other_count} ({other_count / total * 100:.0f}%)")
+            oc3.metric("Internal", f"{total - other_count} ({(total - other_count) / total * 100:.0f}%)")
+
+        st.header("Who Are We Reviewing?")
+        st.caption("PR authors outside your teams whose PRs your teams reviewed")
+
+        all_team_members = set()
+        for t in TEAMS:
+            all_team_members.update(prs[prs["team_name"] == t]["author_login"].unique())
+
+        external_reviews = team_reviews_ranged[
+            ~team_reviews_ranged["pr_author"].isin(all_team_members)
+        ].copy()
+
+        if len(external_reviews) > 0:
+            ext_by_author = (
+                external_reviews
+                .groupby("pr_author")
+                .agg(
+                    reviews=("review_key", "count"),
+                    unique_prs=("pr_key", "nunique"),
+                )
+                .reset_index()
+                .sort_values("reviews", ascending=False)
+            )
+
+            top_n = ext_by_author.head(15)
+            fig = px.bar(
+                top_n,
+                x="pr_author",
+                y="reviews",
+                title="Top External Authors Reviewed by Your Teams",
+                labels={"pr_author": "PR Author", "reviews": "Reviews"},
+                text="unique_prs",
+            )
+            fig.update_traces(texttemplate="%{text} PRs", textposition="outside")
+            fig.update_layout(xaxis_tickangle=-45)
+            st.plotly_chart(fig, use_container_width=True)
+
+            with st.expander("Full table"):
+                ext_by_author.columns = ["PR Author", "Reviews", "Unique PRs"]
+                st.dataframe(ext_by_author, hide_index=True, use_container_width=True)
+        else:
+            st.info("No external reviews found in this date range.")
+
+    # ── PR Size tab ────────────────────────────────────────────────────────
+
+    with tab_pr_size:
+
+        st.header("PR Size — Authored by Team")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.plotly_chart(
+                stat_chart(
+                    team_prs_ranged, "created_date", "files_changed",
+                    color_col if not drill_down else "team_name",
+                    "Files Changed (Avg + P90)",
+                ),
+                use_container_width=True,
+            )
+        with col2:
+            st.plotly_chart(
+                stat_chart(
+                    team_prs_ranged, "created_date", "total_lines_changed",
+                    color_col if not drill_down else "team_name",
+                    "Lines Changed (Avg + P90)",
+                ),
+                use_container_width=True,
+            )
+
+        st.header("PR Size — Reviewed by Team")
+
+        review_prs = (
+            team_reviews_ranged
+            .drop_duplicates(subset=["pr_key", "reviewer_login"])
+            .dropna(subset=["files_changed"])
         )
 
-        top_n = ext_by_author.head(15)
-        fig = px.bar(
-            top_n,
-            x="pr_author",
-            y="reviews",
-            title="Top External Authors Reviewed by Your Teams",
-            labels={"pr_author": "PR Author", "reviews": "Reviews"},
-            text="unique_prs",
-        )
-        fig.update_traces(texttemplate="%{text} PRs", textposition="outside")
-        fig.update_layout(xaxis_tickangle=-45)
-        st.plotly_chart(fig, use_container_width=True)
+        col3, col4 = st.columns(2)
+        with col3:
+            st.plotly_chart(
+                stat_chart(
+                    review_prs, "review_date", "files_changed",
+                    review_color_col if not drill_down else "reviewer_team",
+                    "Files Changed on Reviewed PRs (Avg + P90)",
+                ),
+                use_container_width=True,
+            )
+        with col4:
+            st.plotly_chart(
+                stat_chart(
+                    review_prs, "review_date", "total_lines_changed",
+                    review_color_col if not drill_down else "reviewer_team",
+                    "Lines Changed on Reviewed PRs (Avg + P90)",
+                ),
+                use_container_width=True,
+            )
 
-        with st.expander("Full table"):
-            ext_by_author.columns = ["PR Author", "Reviews", "Unique PRs"]
-            st.dataframe(ext_by_author, hide_index=True, use_container_width=True)
-    else:
-        st.info("No external reviews found in this date range.")
+    # ── Cycle Time tab ─────────────────────────────────────────────────────
 
-    # ── Section 3: PR Size — Authored ───────────────────────────────────────
+    with tab_cycle_time:
 
-    st.header("PR Size — Authored by Team")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.plotly_chart(
-            stat_chart(
-                team_prs_ranged, "created_date", "files_changed",
-                color_col if not drill_down else "team_name",
-                "Files Changed (Avg + P90)",
-            ),
-            use_container_width=True,
-        )
-    with col2:
-        st.plotly_chart(
-            stat_chart(
-                team_prs_ranged, "created_date", "total_lines_changed",
-                color_col if not drill_down else "team_name",
-                "Lines Changed (Avg + P90)",
-            ),
-            use_container_width=True,
+        st.header("Task Cycle Time — In Progress → Done")
+        st.caption(
+            "For Jira issues linked to merged PRs: three-phase breakdown from "
+            "In Progress → first PR opened → last PR merged → Done. "
+            "Uses Jira changelog timestamps for accurate lifecycle tracking."
         )
 
-    # ── Section 4: PR Size — Reviewed ───────────────────────────────────────
+        if not task_cycles.empty:
+            tc = task_cycles[task_cycles["team_name"].isin(selected_teams)]
+            tc = tc[
+                (tc["done_date"] >= start_date) & (tc["done_date"] <= end_date)
+            ]
 
-    st.header("PR Size — Reviewed by Team")
+            if not tc.empty:
+                tc_single = tc[tc["pr_count"] == 1]
+                tc_multi = tc[tc["pr_count"] > 1]
 
-    review_prs = (
-        team_reviews_ranged
-        .drop_duplicates(subset=["pr_key", "reviewer_login"])
-        .dropna(subset=["files_changed"])
-    )
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("Linked Issues", f"{len(tc_single)} single-PR",
+                           delta=f"{len(tc_multi)} multi-PR", delta_color="off")
+                k2.metric("Median Pre-PR (hrs)",
+                           f"{tc_single['pre_pr_hours'].median():.1f}",
+                           delta=f"mean: {tc_single['pre_pr_hours'].mean():.1f}",
+                           delta_color="off")
+                k3.metric("Median PR Cycle (hrs)",
+                           f"{tc_single['pr_cycle_hours'].median():.1f}",
+                           delta=f"mean: {tc_single['pr_cycle_hours'].mean():.1f}",
+                           delta_color="off")
+                k4.metric("Median Total (hrs)",
+                           f"{tc_single['total_cycle_hours'].median():.1f}",
+                           delta=f"PR is {tc_single['pr_pct'].median():.0f}% of total",
+                           delta_color="off")
 
-    col3, col4 = st.columns(2)
-    with col3:
-        st.plotly_chart(
-            stat_chart(
-                review_prs, "review_date", "files_changed",
-                review_color_col if not drill_down else "reviewer_team",
-                "Files Changed on Reviewed PRs (Avg + P90)",
-            ),
-            use_container_width=True,
-        )
-    with col4:
-        st.plotly_chart(
-            stat_chart(
-                review_prs, "review_date", "total_lines_changed",
-                review_color_col if not drill_down else "reviewer_team",
-                "Lines Changed on Reviewed PRs (Avg + P90)",
-            ),
-            use_container_width=True,
-        )
+                col_a, col_b = st.columns(2)
 
-    # ── Section 5: Task Cycle Time ─────────────────────────────────────────
+                with col_a:
+                    agg = (
+                        tc_single.groupby("authoring")
+                        .agg(
+                            issues=("issue_key", "count"),
+                            med_pre_pr=("pre_pr_hours", "median"),
+                            med_pr=("pr_cycle_hours", "median"),
+                            med_post=("post_merge_hours", "median"),
+                        )
+                        .reset_index()
+                    )
+                    fig = go.Figure()
+                    fig.add_trace(go.Bar(
+                        x=agg["authoring"], y=agg["med_pre_pr"],
+                        name="Pre-PR (In Progress → first PR)",
+                        marker_color="#19D3F3",
+                        text=agg["med_pre_pr"].round(1),
+                        textposition="inside",
+                    ))
+                    fig.add_trace(go.Bar(
+                        x=agg["authoring"], y=agg["med_pr"],
+                        name="PR Review (first PR → merged)",
+                        marker_color="#AB63FA",
+                        text=agg["med_pr"].round(1),
+                        textposition="inside",
+                    ))
+                    fig.add_trace(go.Bar(
+                        x=agg["authoring"], y=agg["med_post"],
+                        name="Post-merge (merged → Done)",
+                        marker_color="#636EFA",
+                        text=agg["med_post"].round(1),
+                        textposition="inside",
+                    ))
+                    fig.update_layout(
+                        title="Median Cycle Breakdown (Single-PR Issues)",
+                        barmode="stack",
+                        yaxis_title="Hours",
+                        legend=dict(orientation="h", y=-0.2),
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
 
-    st.header("Task Cycle Time — In Progress → Done")
-    st.caption(
-        "For Jira issues linked to merged PRs: three-phase breakdown from "
-        "In Progress → first PR opened → last PR merged → Done. "
-        "Uses Jira changelog timestamps for accurate lifecycle tracking."
-    )
+                with col_b:
+                    fig2 = px.box(
+                        tc, x="authoring", y="pr_pct",
+                        color="authoring",
+                        color_discrete_map=AI_COLORS,
+                        title="PR Time as % of Total Cycle",
+                        labels={"pr_pct": "% of Cycle in PR", "authoring": ""},
+                    )
+                    fig2.update_layout(showlegend=False)
+                    st.plotly_chart(fig2, use_container_width=True)
 
-    if not task_cycles.empty:
-        tc = task_cycles[task_cycles["team_name"].isin(selected_teams)]
-        tc = tc[
-            (tc["done_date"] >= start_date) & (tc["done_date"] <= end_date)
-        ]
-
-        if not tc.empty:
-            tc_single = tc[tc["pr_count"] == 1]
-            tc_multi = tc[tc["pr_count"] > 1]
-
-            k1, k2, k3, k4 = st.columns(4)
-            k1.metric("Linked Issues", f"{len(tc_single)} single-PR",
-                       delta=f"{len(tc_multi)} multi-PR", delta_color="off")
-            k2.metric("Median Pre-PR (hrs)",
-                       f"{tc_single['pre_pr_hours'].median():.1f}",
-                       delta=f"mean: {tc_single['pre_pr_hours'].mean():.1f}",
-                       delta_color="off")
-            k3.metric("Median PR Cycle (hrs)",
-                       f"{tc_single['pr_cycle_hours'].median():.1f}",
-                       delta=f"mean: {tc_single['pr_cycle_hours'].mean():.1f}",
-                       delta_color="off")
-            k4.metric("Median Total (hrs)",
-                       f"{tc_single['total_cycle_hours'].median():.1f}",
-                       delta=f"PR is {tc_single['pr_pct'].median():.0f}% of total",
-                       delta_color="off")
-
-            col_a, col_b = st.columns(2)
-
-            with col_a:
-                agg = (
-                    tc_single.groupby("authoring")
+                tc_monthly = tc_single.copy()
+                tc_monthly["month"] = pd.to_datetime(tc_monthly["done_date"]).dt.to_period("M").dt.to_timestamp()
+                monthly_agg = (
+                    tc_monthly.groupby(["month", "authoring"])
                     .agg(
-                        issues=("issue_key", "count"),
-                        med_pre_pr=("pre_pr_hours", "median"),
-                        med_pr=("pr_cycle_hours", "median"),
-                        med_post=("post_merge_hours", "median"),
+                        med_pr_hrs=("pr_cycle_hours", "median"),
+                        med_total_hrs=("total_cycle_hours", "median"),
+                        count=("issue_key", "count"),
                     )
                     .reset_index()
                 )
-                fig = go.Figure()
-                fig.add_trace(go.Bar(
-                    x=agg["authoring"], y=agg["med_pre_pr"],
-                    name="Pre-PR (In Progress → first PR)",
-                    marker_color="#19D3F3",
-                    text=agg["med_pre_pr"].round(1),
-                    textposition="inside",
-                ))
-                fig.add_trace(go.Bar(
-                    x=agg["authoring"], y=agg["med_pr"],
-                    name="PR Review (first PR → merged)",
-                    marker_color="#AB63FA",
-                    text=agg["med_pr"].round(1),
-                    textposition="inside",
-                ))
-                fig.add_trace(go.Bar(
-                    x=agg["authoring"], y=agg["med_post"],
-                    name="Post-merge (merged → Done)",
-                    marker_color="#636EFA",
-                    text=agg["med_post"].round(1),
-                    textposition="inside",
-                ))
-                fig.update_layout(
-                    title="Median Cycle Breakdown (Single-PR Issues)",
-                    barmode="stack",
-                    yaxis_title="Hours",
-                    legend=dict(orientation="h", y=-0.2),
-                )
-                st.plotly_chart(fig, use_container_width=True)
+                if len(monthly_agg["month"].unique()) > 1:
+                    fig3 = px.line(
+                        monthly_agg, x="month", y="med_pr_hrs",
+                        color="authoring",
+                        color_discrete_map=AI_COLORS,
+                        markers=True,
+                        title="Median PR Cycle Time by Month (Single-PR Issues)",
+                        labels={"month": "Month", "med_pr_hrs": "Hours", "authoring": ""},
+                    )
+                    fig3.update_layout(
+                        xaxis_tickformat="%b %Y",
+                        legend=dict(orientation="h", y=-0.15),
+                    )
+                    st.plotly_chart(fig3, use_container_width=True)
 
-            with col_b:
-                fig2 = px.box(
-                    tc, x="authoring", y="pr_pct",
-                    color="authoring",
-                    color_discrete_map=AI_COLORS,
-                    title="PR Time as % of Total Cycle",
-                    labels={"pr_pct": "% of Cycle in PR", "authoring": ""},
-                )
-                fig2.update_layout(showlegend=False)
-                st.plotly_chart(fig2, use_container_width=True)
-
-            tc_monthly = tc_single.copy()
-            tc_monthly["month"] = pd.to_datetime(tc_monthly["done_date"]).dt.to_period("M").dt.to_timestamp()
-            monthly_agg = (
-                tc_monthly.groupby(["month", "authoring"])
-                .agg(
-                    med_pr_hrs=("pr_cycle_hours", "median"),
-                    med_total_hrs=("total_cycle_hours", "median"),
-                    count=("issue_key", "count"),
-                )
-                .reset_index()
-            )
-            if len(monthly_agg["month"].unique()) > 1:
-                fig3 = px.line(
-                    monthly_agg, x="month", y="med_pr_hrs",
-                    color="authoring",
-                    color_discrete_map=AI_COLORS,
-                    markers=True,
-                    title="Median PR Cycle Time by Month (Single-PR Issues)",
-                    labels={"month": "Month", "med_pr_hrs": "Hours", "authoring": ""},
-                )
-                fig3.update_layout(
-                    xaxis_tickformat="%b %Y",
-                    legend=dict(orientation="h", y=-0.15),
-                )
-                st.plotly_chart(fig3, use_container_width=True)
-
-            with st.expander("Raw data"):
-                display_cols = [
-                    "issue_key", "authoring", "team_name", "pr_count",
-                    "pre_pr_hours", "pr_cycle_hours", "post_merge_hours",
-                    "total_cycle_hours", "pr_pct", "story_points", "sprint_name",
-                ]
-                show = tc[display_cols].copy()
-                for c in ("pre_pr_hours", "pr_cycle_hours", "post_merge_hours",
-                          "total_cycle_hours", "pr_pct"):
-                    show[c] = show[c].round(1)
-                show.columns = [
-                    "Issue", "Authoring", "Team", "PRs",
-                    "Pre-PR Hrs", "PR Hrs", "Post-merge Hrs",
-                    "Total Hrs", "PR %", "Story Pts", "Sprint",
-                ]
-                st.dataframe(
-                    show.sort_values("Total Hrs", ascending=False),
-                    hide_index=True, use_container_width=True,
-                )
+                with st.expander("Raw data"):
+                    display_cols = [
+                        "issue_key", "authoring", "team_name", "pr_count",
+                        "pre_pr_hours", "pr_cycle_hours", "post_merge_hours",
+                        "total_cycle_hours", "pr_pct", "story_points", "sprint_name",
+                    ]
+                    show = tc[display_cols].copy()
+                    for c in ("pre_pr_hours", "pr_cycle_hours", "post_merge_hours",
+                              "total_cycle_hours", "pr_pct"):
+                        show[c] = show[c].round(1)
+                    show.columns = [
+                        "Issue", "Authoring", "Team", "PRs",
+                        "Pre-PR Hrs", "PR Hrs", "Post-merge Hrs",
+                        "Total Hrs", "PR %", "Story Pts", "Sprint",
+                    ]
+                    st.dataframe(
+                        show.sort_values("Total Hrs", ascending=False),
+                        hide_index=True, use_container_width=True,
+                    )
+            else:
+                st.info("No linked Jira issues found in this date range.")
         else:
-            st.info("No linked Jira issues found in this date range.")
-    else:
-        st.info(
-            "No Jira data available. Run the Jira ETL with --backfill "
-            "to load Jira issues linked to PRs."
-        )
+            st.info(
+                "No Jira data available. Run the Jira ETL with --backfill "
+                "to load Jira issues linked to PRs."
+            )
 
     # ── Drill-down tables ───────────────────────────────────────────────────
 
