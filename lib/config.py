@@ -239,6 +239,205 @@ def get_jira_status_categories():
     }
 
 
+def get_jira_support_config():
+    """Return support ticket config, or None if not configured.
+
+    Shape: {project, team_field, priority_field, severity_field,
+            impact_field, teams: [...]}
+    """
+    support = load_config().get("jira", {}).get("support")
+    if not support or not support.get("project"):
+        return None
+    return {
+        "project": support["project"],
+        "team_field": support.get("team_field"),
+        "priority_field": support.get("priority_field"),
+        "severity_field": support.get("severity_field"),
+        "impact_field": support.get("impact_field"),
+        "teams": list(support.get("teams", [])),
+    }
+
+
+# ── Webex ──────────────────────────────────────────────────────────────────
+
+
+def _parse_env_file(path):
+    """Parse a KEY=VALUE file (quoted or not), ignoring blanks and comments."""
+    out = {}
+    with open(os.path.expanduser(path)) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            out[k.strip()] = v.strip().strip('"').strip("'")
+    return out
+
+
+def get_webex_integration():
+    """Load Webex Integration credentials.
+
+    Returns a dict with client_id, client_secret, redirect_uri (plus optional
+    scopes). Reads the path from config.webex.integration_path; falls back to
+    individual WEBEX_CLIENT_ID / WEBEX_CLIENT_SECRET / WEBEX_REDIRECT_URI env
+    vars if the file doesn't exist.
+    """
+    cfg = load_config().get("webex", {})
+    path = cfg.get("integration_path", "~/.webex_integration")
+    data = {}
+    if os.path.exists(os.path.expanduser(path)):
+        data = _parse_env_file(path)
+
+    client_id = data.get("CLIENT_ID") or os.environ.get("WEBEX_CLIENT_ID")
+    client_secret = data.get("CLIENT_SECRET") or os.environ.get("WEBEX_CLIENT_SECRET")
+    redirect_uri = (
+        data.get("REDIRECT_URL")
+        or data.get("REDIRECT_URI")
+        or os.environ.get("WEBEX_REDIRECT_URI")
+    )
+
+    if not (client_id and client_secret and redirect_uri):
+        print(
+            "ERROR: Webex integration not fully configured. Need "
+            "CLIENT_ID, CLIENT_SECRET, REDIRECT_URL in the integration file.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    return {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "redirect_uri": redirect_uri,
+    }
+
+
+def get_webex_config():
+    """Return webex config section or None."""
+    cfg = load_config().get("webex")
+    if not cfg:
+        return None
+    return {
+        "room_id": cfg.get("room_id"),
+        "room_title": cfg.get("room_title"),
+        "integration_path": cfg.get("integration_path", "~/.webex_integration"),
+        "refresh_token_path": cfg.get("refresh_token_path", "~/.webex_refresh_token"),
+        "team_emails": [
+            {"team": t.get("team"), "emails": set(t.get("emails", []))}
+            for t in cfg.get("team_emails", [])
+        ],
+    }
+
+
+def get_webex_email_team_lookup():
+    """Return {email_lowercase: team_name} for Webex author attribution."""
+    webex = get_webex_config()
+    if not webex:
+        return {}
+    out = {}
+    for entry in webex["team_emails"]:
+        team = entry["team"]
+        for email in entry["emails"]:
+            out[email.lower()] = team
+    return out
+
+
+# ── VictorOps ──────────────────────────────────────────────────────────────
+
+
+def get_victorops_config():
+    """Return victorops config, or None if not configured."""
+    vo = load_config().get("victorops")
+    if not vo or not vo.get("team_slug"):
+        return None
+    return {
+        "credentials_path": vo.get("credentials_path", "~/.victorops"),
+        "team_slug": vo["team_slug"],
+        "exclude_service_patterns": list(vo.get("exclude_service_patterns", [])),
+    }
+
+
+def get_victorops_credentials():
+    """Read API_ID and API_KEY from the VictorOps credentials file.
+
+    File format is `KEY:value` or `KEY=value`, one per line, tolerant of both.
+    """
+    cfg = get_victorops_config()
+    if not cfg:
+        print("ERROR: [victorops] not configured in config.toml", file=sys.stderr)
+        sys.exit(1)
+    path = os.path.expanduser(cfg["credentials_path"])
+    if not os.path.exists(path):
+        print(f"ERROR: VictorOps credentials not found at {path}", file=sys.stderr)
+        sys.exit(1)
+
+    api_id = api_key = None
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            for sep in (":", "="):
+                if sep in line:
+                    k, _, v = line.partition(sep)
+                    k, v = k.strip().upper(), v.strip()
+                    if k == "API_ID":
+                        api_id = v
+                    elif k == "API_KEY":
+                        api_key = v
+                    break
+
+    if not (api_id and api_key):
+        print(
+            f"ERROR: VictorOps credentials file {path} must contain API_ID and API_KEY",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return {"api_id": api_id, "api_key": api_key}
+
+
+# ── FireHydrant ────────────────────────────────────────────────────────────
+
+
+def get_firehydrant_config():
+    """Return firehydrant config, or None if not configured."""
+    fh = load_config().get("firehydrant")
+    if not fh or not fh.get("team_id"):
+        return None
+    return {
+        "token_path": fh.get("token_path", "~/.firehydrant_token"),
+        "team_id": fh["team_id"],
+    }
+
+
+def get_firehydrant_token():
+    """Read the FireHydrant bot token from the configured path."""
+    cfg = get_firehydrant_config()
+    if not cfg:
+        print("ERROR: [firehydrant] not configured", file=sys.stderr)
+        sys.exit(1)
+    env = os.environ.get("FIREHYDRANT_TOKEN")
+    if env:
+        return env.strip()
+    return _read_token_file(cfg["token_path"])
+
+
+# ── Categories ─────────────────────────────────────────────────────────────
+
+
+def get_categories():
+    """Return the list of top-level category definitions.
+
+    Each item: {name: str, patterns: [regex, ...]}.
+    First match wins at query time, so order in config matters.
+    """
+    cfg = load_config()
+    return [
+        {"name": c["name"], "patterns": list(c.get("patterns", []))}
+        for c in cfg.get("categories", [])
+        if c.get("name")
+    ]
+
+
 # ── Database ───────────────────────────────────────────────────────────────
 
 

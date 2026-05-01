@@ -2,6 +2,158 @@
 # Copy to config.toml and edit for your org:
 #   cp config.example.toml config.toml
 
+# ── Categories (shared across data sources) ────────────────────────────────
+# Pattern-matching rules used to bucket support tickets, chat messages, etc.
+# into meaningful categories (product area, integration type, ...). Applied at
+# query time against a source-appropriate text field (Jira summary, Webex
+# message body, etc). First match wins, so list specific patterns before
+# generic fallbacks. Patterns are case-insensitive regex.
+
+[[categories]]
+name = "SCIM - Inbound"
+patterns = ["inbound scim", "scim.*inbound"]
+
+[[categories]]
+name = "SCIM - Outbound"
+patterns = ["outbound[ _]scim", "scim.*outbound"]
+
+[[categories]]
+name = "SCIM - Generic"
+patterns = [
+    "generic scim",
+    "\\bscim\\b",
+    "\\b(SAML|Identity Center|User) [Pp]rovisioning\\b",
+    "\\bprovisioning (error|fail|setup|issue)\\b",
+    "\\b(in|out)_scim",
+]
+
+[[categories]]
+name = "Verified Service Providers"
+patterns = ["verified (service provider|sp)", "\\bvsp\\b"]
+
+[[categories]]
+name = "AD Sync"
+patterns = [
+    "ad sync",
+    "active directory sync",
+    "adsync",
+    "\\badministrative units?\\b",
+]
+
+[[categories]]
+name = "User Sync"
+patterns = ["user sync", "usersync"]
+
+[[categories]]
+name = "Admin Sync"
+patterns = ["admin sync", "adminsync"]
+
+[[categories]]
+name = "Automated Provisioning"
+patterns = [
+    "automated provisioning",
+    "auto.?provisioning",
+    "(inbound|outbound) (sync|provisioning)",
+]
+
+[[categories]]
+name = "User Flavor"
+patterns = ["user flavor", "user service", "userserv"]
+
+[[categories]]
+name = "Admin Panel"
+patterns = ["admin panel", "admin.{0,20}page"]
+
+[[categories]]
+name = "Entra / Azure AD"
+patterns = [
+    "\\bentra\\b",
+    "\\bazure\\s*ad\\b",
+    "\\bazure\\b.*(tenant|sync|ad)",
+]
+
+[[categories]]
+name = "Custom Admin Roles"
+patterns = [
+    "\\bcustom admin roles?\\b",
+    "\\bcars?\\b(?![a-z])",
+]
+
+[[categories]]
+name = "Custom Attributes"
+patterns = [
+    "\\bcustom attribute",
+    "\\battribute\\b.*(sync|missing|create|extension|ownership|add)",
+    "\\b(add|missing) attributes?\\b",
+    "\\bextensionattribute\\d+",
+    "\\bmiddlename\\b",
+]
+
+[[categories]]
+name = "Feature Flag"
+patterns = [
+    "\\bfeature[- ]?flag",
+    "\\bhas_feature\\b",
+    "FEATURE_[A-Z_]+",
+    "\\bff\\b(?![a-z])",
+]
+
+[[categories]]
+name = "Rate Limit / Capacity"
+patterns = [
+    "\\brate limit",
+    "\\bbulk (create|limit|user)",
+    "\\b(directory )?sync (increase|limit|rate|capacity)",
+    "\\brequests? (per|/) minute",
+    "\\bincrease .{0,30}(limit|rate|cap)",
+]
+
+[[categories]]
+name = "Auth Proxy"
+patterns = ["\\bauth[ _-]?proxy\\b"]
+
+[[categories]]
+name = "Password"
+patterns = ["\\bpassword(s|\\W)", "\\buserpasswordservice\\b"]
+
+# Non-ask chatter — filter these before PR Review Request so casual
+# messages don't get shoehorned into an actionable category.
+[[categories]]
+name = "Chatter / Non-Ask"
+patterns = [
+    "^FYI\\s*:",
+    "^webexteams://\\S+\\s*$",
+    "^Attached the video",
+    "^Only users in the domain",
+    "\\+\\+\\s*:that:\\s*$",
+]
+
+# PR Review Request — last resort. Requires review intent, not just a
+# GitHub URL. Bug reports with PR links won't match unless intent is
+# explicit.
+[[categories]]
+name = "PR Review Request"
+patterns = [
+    "\\blooking for (a |an |another |one )?(review|approval)\\b",
+    "\\bcan i (please )?(get |have )?\\w{0,30}?(review|eyes|feedback|approval|look)\\b",
+    "\\bappreciate .{0,30}\\breview\\b",
+    "\\bneed(s|ed)? .{0,20}\\breview\\b",
+    "\\bplease review\\b",
+    "\\bsme review\\b",
+    "\\breview request\\b",
+    "\\beyes on\\b",
+    "\\breviewers?\\b(?! of )",
+    "\\breview\\b.{0,100}pull/\\d+",
+    "pull/\\d+.{0,100}\\breview\\b",
+    "\\b(love|like) .{0,40}(review|eyes|perspective).{0,40}\\bpr\\b",
+    "\\bblocked by review\\b",
+    "\\bhere'?s? a PR\\b",
+    "\\bhave (a |some |\\d+ )?PRs?\\b.{0,60}\\b(review|approval|blocked|eyes|merge|need)\\b",
+    "\\bi'?ve got a (small |quick |tiny )?PR\\b",
+    "\\b(merge|land|approve|review) (this |my |our |a |the )PR\\b",
+    "\\bPR (that|which) needs\\b",
+]
+
 # ── GitHub ─────────────────────────────────────────────────────────────────
 
 [github]
@@ -35,6 +187,68 @@ sprint = "customfield_10020"
 # Which Jira status names count as "in progress" and "done" for cycle time
 in_progress = ["In Progress", "In Development"]
 done = ["Done", "Closed", "Resolved"]
+
+[jira.support]
+# Optional: Jira project that tracks support escalations. If set, the ETL will
+# ingest tickets scoped to the teams listed below (by value of team_field) and
+# capture comment_count + the support-specific custom fields. Changelog fetch
+# is skipped for these tickets because they don't go through the dev lifecycle.
+project = "ZTCE"
+team_field = "customfield_10001"          # "Team" custom field — scopes ownership
+priority_field = "customfield_11649"      # e.g. P1/P2/P3
+severity_field = "customfield_11619"      # e.g. "4 - Low"
+impact_field = "customfield_11651"        # Customer impact classification
+teams = [
+    "ZT - Duo Directory",
+    "ZT - Duo Directory Augmentation",
+]
+
+# ── Webex ──────────────────────────────────────────────────────────────────
+# Optional: ingest messages from a Webex room. Uses an OAuth Integration
+# (user auth, not a bot) because bots can't read group-room history.
+# Run scripts/webex_auth.py once to generate the refresh token.
+
+[webex]
+# Find the roomId by listing rooms via the API, or let webex_auth.py print it.
+# room_title is just for display; room_id is what the API needs.
+room_id = ""
+room_title = "help-duo-directory"
+
+# Where the integration client_id/secret/redirect_uri live. Defaults shown.
+integration_path = "~/.webex_integration"
+# Where the refresh token will be written by scripts/webex_auth.py.
+refresh_token_path = "~/.webex_refresh_token"
+
+# Map Webex email → team name. Any email not listed falls into "Other".
+[[webex.team_emails]]
+team = "Duo Directory"
+emails = []
+
+[[webex.team_emails]]
+team = "Duo Directory Augmentation"
+emails = []
+
+# ── VictorOps ─────────────────────────────────────────────────────────────
+# Optional: ingest on-call incidents from VictorOps / Splunk On-Call.
+# The ETL fetches all incidents where pagedTeams includes team_slug, then
+# classifies each by whether a team member was actually paged or responded.
+
+[victorops]
+# File storing API credentials in KEY:VALUE format (API_ID and API_KEY).
+credentials_path = "~/.victorops"
+team_slug = "team-xxxxxxxxxxxx"
+# Services to drop entirely (weekly drills, test pages). Case-insensitive regex.
+exclude_service_patterns = ["weekly page test", "weekly test incident"]
+
+# ── FireHydrant ────────────────────────────────────────────────────────────
+# Optional: ingest incidents from FireHydrant (incident management).
+
+[firehydrant]
+# Path to a file containing a single-line FH bot token.
+token_path = "~/.firehydrant_token"
+# Team UUID to scope incidents to. Find it at
+# https://app.firehydrant.io/teams (or GET /v1/teams via the API).
+team_id = ""
 
 # ── Database ───────────────────────────────────────────────────────────────
 

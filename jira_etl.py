@@ -32,7 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lib.config import (
     load_config, get_jira_token, get_jira_email, get_jira_base_url,
     get_jira_projects, get_jira_custom_fields, get_jira_status_categories,
-    get_db_path,
+    get_jira_support_config, get_db_path,
 )
 from lib.db import (
     log, is_error, get_db_connection, with_db_retry,
@@ -44,6 +44,7 @@ from lib.db import (
 cfg = load_config()
 custom_fields = get_jira_custom_fields()
 status_cats = get_jira_status_categories()
+support_cfg = get_jira_support_config()
 
 # Build the list of Jira fields to request
 JIRA_FIELDS = [
@@ -55,6 +56,16 @@ JIRA_FIELDS = [
 for field_id in custom_fields.values():
     if field_id not in JIRA_FIELDS:
         JIRA_FIELDS.append(field_id)
+
+# Support-specific fields (only when support tickets are configured)
+SUPPORT_FIELDS = []
+if support_cfg:
+    # 'comment' gives us comment.total without a second API call
+    SUPPORT_FIELDS.append("comment")
+    for key in ("team_field", "priority_field", "severity_field", "impact_field"):
+        fid = support_cfg.get(key)
+        if fid and fid not in SUPPORT_FIELDS and fid not in JIRA_FIELDS:
+            SUPPORT_FIELDS.append(fid)
 
 # ── Jira API ─────────────────────────────────────────────────────────────────
 
@@ -205,6 +216,15 @@ def extract_sprint_info(sprint_field_value):
     )
 
 
+def _extract_option_value(v):
+    """A Jira option field can be a dict {value: ...}, a list of those, or a scalar."""
+    if isinstance(v, dict):
+        return v.get("value") or v.get("name")
+    if isinstance(v, list):
+        return [_extract_option_value(x) for x in v]
+    return v
+
+
 def transform_issue(issue):
     """Transform a Jira API issue into a flat record for SQLite."""
     fields = issue.get("fields", {})
@@ -248,6 +268,25 @@ def transform_issue(issue):
             if val is not None:
                 extra_custom[logical_name] = val
 
+    # Support-ticket custom fields (flattened to readable values)
+    if support_cfg and project_key == support_cfg["project"]:
+        for logical_name, cfg_key in (
+            ("support_team", "team_field"),
+            ("support_priority", "priority_field"),
+            ("support_severity", "severity_field"),
+            ("support_impact", "impact_field"),
+        ):
+            fid = support_cfg.get(cfg_key)
+            if fid:
+                val = _extract_option_value(fields.get(fid))
+                if val is not None:
+                    extra_custom[logical_name] = val
+
+    comment_count = None
+    comment_field = fields.get("comment")
+    if isinstance(comment_field, dict):
+        comment_count = comment_field.get("total")
+
     return {
         "issue_key": key,
         "issue_id": issue.get("id"),
@@ -278,6 +317,7 @@ def transform_issue(issue):
         "resolved_at": normalize_jira_timestamp(fields.get("resolutiondate")),
         "in_progress_at": None,
         "done_at": None,
+        "comment_count": comment_count,
     }
 
 
@@ -315,6 +355,7 @@ JIRA_DDL = [
         resolved_at             TEXT,
         in_progress_at          TEXT,
         done_at                 TEXT,
+        comment_count           INTEGER,
         etl_loaded_at           TEXT
     )
     """,
@@ -359,6 +400,9 @@ def ensure_jira_tables(conn):
     if "custom_fields_json" not in cols:
         conn.execute("ALTER TABLE dim_jira_issue ADD COLUMN custom_fields_json TEXT")
         log("  Migration: added custom_fields_json column to dim_jira_issue")
+    if "comment_count" not in cols:
+        conn.execute("ALTER TABLE dim_jira_issue ADD COLUMN comment_count INTEGER")
+        log("  Migration: added comment_count column to dim_jira_issue")
 
     conn.commit()
     log("  Jira tables ensured.")
@@ -377,10 +421,10 @@ def upsert_jira_issue(conn, record):
             story_points, sprint_id, sprint_name, sprint_state,
             board_id, sprint_start_date, sprint_end_date, custom_fields_json,
             created_at, updated_at, resolved_at,
-            in_progress_at, done_at, etl_loaded_at
+            in_progress_at, done_at, comment_count, etl_loaded_at
         ) VALUES (
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         """,
         (
@@ -397,7 +441,7 @@ def upsert_jira_issue(conn, record):
             record["sprint_end_date"], record["custom_fields_json"],
             record["created_at"], record["updated_at"],
             record["resolved_at"], record["in_progress_at"],
-            record["done_at"], now,
+            record["done_at"], record.get("comment_count"), now,
         ),
     )
 
@@ -622,6 +666,54 @@ def main():
 
             if not args.dry_run and total_processed % 200 == 0:
                 with_db_retry(db_conn.commit)
+
+        # ── Support ticket fetch (separate JQL, no changelog) ────────────
+        # Jira's Team field (customfield_10001) stores a team object, not a
+        # string, and JQL 'in' matching on it requires team IDs rather than
+        # names. Simpler: fetch all tickets in the support project for the
+        # window, filter client-side by the team name.
+        if support_cfg and support_cfg.get("teams"):
+            support_jql = (
+                f"project = {support_cfg['project']} "
+                f"AND updated >= '{since_date}' "
+                f"AND updated <= '{until_date} 23:59' "
+                f"ORDER BY updated ASC"
+            )
+
+            log(f"Support JQL: {support_jql}")
+            support_issues = search_all_issues(
+                email, token, base_url, support_jql,
+                fields=JIRA_FIELDS + SUPPORT_FIELDS,
+            )
+
+            team_field = support_cfg.get("team_field")
+            allowed_teams = set(support_cfg["teams"])
+
+            def _matches_team(issue):
+                if not team_field:
+                    return True
+                team = (issue.get("fields") or {}).get(team_field)
+                if isinstance(team, dict):
+                    return team.get("name") in allowed_teams
+                return False
+
+            scoped = [i for i in support_issues if _matches_team(i)]
+            log(
+                f"Fetched {len(support_issues)} support issues "
+                f"({len(scoped)} matched configured teams)"
+            )
+
+            for issue in scoped:
+                record = transform_issue(issue)
+                # No changelog fetch for support tickets.
+                if args.dry_run:
+                    if args.verbose or total_processed < 3:
+                        print(json.dumps(record, indent=2, default=str))
+                else:
+                    with_db_retry(lambda r=record: upsert_jira_issue(db_conn, r))
+                total_processed += 1
+                if not args.dry_run and total_processed % 200 == 0:
+                    with_db_retry(db_conn.commit)
 
     # Finalize
     if db_conn and not args.dry_run:

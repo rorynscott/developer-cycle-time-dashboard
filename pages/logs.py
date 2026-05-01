@@ -26,6 +26,21 @@ ETL_CONFIGS = [
         "log_file": os.path.join(LOG_DIR, "jira_etl.log"),
         "error_file": os.path.join(LOG_DIR, "jira_etl_errors.log"),
     },
+    {
+        "name": "Webex ETL",
+        "log_file": os.path.join(LOG_DIR, "webex_etl.log"),
+        "error_file": os.path.join(LOG_DIR, "webex_etl_errors.log"),
+    },
+    {
+        "name": "VictorOps ETL",
+        "log_file": os.path.join(LOG_DIR, "victorops_etl.log"),
+        "error_file": os.path.join(LOG_DIR, "victorops_etl_errors.log"),
+    },
+    {
+        "name": "FireHydrant ETL",
+        "log_file": os.path.join(LOG_DIR, "firehydrant_etl.log"),
+        "error_file": os.path.join(LOG_DIR, "firehydrant_etl_errors.log"),
+    },
 ]
 
 
