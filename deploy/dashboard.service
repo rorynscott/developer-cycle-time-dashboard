@@ -1,0 +1,18 @@
+[Unit]
+Description=Developer Cycle Time Dashboard (Streamlit)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/dashboard
+ExecStart=/home/ubuntu/dashboard/.venv/bin/streamlit run dashboard.py --server.headless true --server.address 0.0.0.0 --server.port 8501 --server.enableCORS false --server.enableXsrfProtection false
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/home/ubuntu/dashboard/logs/dashboard.log
+StandardError=append:/home/ubuntu/dashboard/logs/dashboard.log
+
+[Install]
+WantedBy=multi-user.target

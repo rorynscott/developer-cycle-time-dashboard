@@ -319,6 +319,24 @@ Data flows through a shared SQLite database:
 - `fact_fh_incident`, `dim_fh_role_assignment` — FireHydrant
 - `etl_watermark*` — per-source incremental-load bookmarks
 
+## Deployment
+
+### Production (Cisco internal)
+
+A copy of this dashboard runs at **https://things.cisco.com/app/duo-directory-cycle-time/** for the Duo Directory and Duo Directory Augmentation teams. It's hosted on a Foundry VM and proxied through the Things platform (`things.cisco.com`), which handles SSO and tile gating.
+
+The systemd unit driving it lives in `deploy/dashboard.service`. Two flags in the `ExecStart` are mandatory when running behind the Things proxy:
+
+```
+--server.enableCORS false --server.enableXsrfProtection false
+```
+
+Without them Streamlit rejects the websocket upgrade because the browser's `Origin` header (`things.cisco.com`) doesn't match the host (Foundry). The dashboard appears to load but never connects — you'll see a permanent loading spinner. These flags do **not** weaken security in this deployment because Cisco SSO + Things tile membership already gate access; do not copy them into a public-internet deployment.
+
+### Local development
+
+For local runs use the simpler command in **Quick Start** above — those flags would weaken security with no benefit when there's no proxy in front of you.
+
 ## License
 
 MIT
