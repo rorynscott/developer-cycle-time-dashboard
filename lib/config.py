@@ -421,6 +421,27 @@ def get_firehydrant_token():
     return _read_token_file(cfg["token_path"])
 
 
+# ── Incidents tab scoping ──────────────────────────────────────────────────
+
+
+def get_incidents_scope():
+    """Return the [incidents] config for team scoping on the Incidents tab.
+
+    Fields:
+        routing_keys      — list of VO routing keys considered 'ours'
+        vo_usernames      — lowercased VO usernames on the team
+        member_emails     — lowercased email addresses (FH role matching)
+        keywords          — lowercased substrings for text match
+    """
+    cfg = load_config().get("incidents") or {}
+    return {
+        "routing_keys": [s.lower() for s in cfg.get("routing_keys", []) if s],
+        "vo_usernames": [s.lower() for s in cfg.get("vo_usernames", []) if s],
+        "member_emails": [s.lower() for s in cfg.get("member_emails", []) if s],
+        "keywords": [s.lower() for s in cfg.get("keywords", []) if s],
+    }
+
+
 # ── Categories ─────────────────────────────────────────────────────────────
 
 

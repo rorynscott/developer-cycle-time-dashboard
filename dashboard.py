@@ -246,21 +246,27 @@ def load_throughput_load_daily():
     except (pd.io.sql.DatabaseError, sqlite3.OperationalError):
         webex_asks = pd.DataFrame(columns=["d", "webex_asks"])
 
-    # 5. FireHydrant S1-S4 per day
-    try:
-        fh_real = pd.read_sql_query(
-            """
-            SELECT DATE(started_at) AS d, COUNT(*) AS fh_real
-            FROM fact_fh_incident
-            WHERE severity IN ('S1','S2','S3','S4')
-            GROUP BY DATE(started_at)
-            """,
-            conn,
-        )
-    except (pd.io.sql.DatabaseError, sqlite3.OperationalError):
-        fh_real = pd.DataFrame(columns=["d", "fh_real"])
-
     conn.close()
+
+    # 5. FireHydrant S1-S4 per day, scoped to incidents where a team
+    #    member held a role OR a configured keyword matched. Uses the
+    #    same filter logic as the Incidents tab for consistency.
+    fh_all, _ = load_fh_incidents()
+    if fh_all.empty:
+        fh_real = pd.DataFrame(columns=["d", "fh_real"])
+    else:
+        scoped = fh_all[
+            fh_all["severity"].isin(["S1", "S2", "S3", "S4"])
+            & (fh_all["match_member"] | fh_all["match_keyword"])
+        ].copy()
+        if scoped.empty:
+            fh_real = pd.DataFrame(columns=["d", "fh_real"])
+        else:
+            fh_real = (
+                scoped.assign(d=scoped["started_at"].dt.date)
+                .groupby("d").size()
+                .reset_index(name="fh_real")
+            )
 
     # Outer-join everything on date
     import functools
@@ -290,13 +296,21 @@ def load_throughput_load_daily():
 
 @st.cache_data(ttl=300)
 def load_fh_incidents():
-    """Load FireHydrant incidents + joined IC (first incident commander)."""
+    """Load FireHydrant incidents + joined IC (first incident commander).
+
+    Also computes per-row match flags against the [incidents] scope:
+      - match_member: any role assignment has user_email in member_emails
+      - match_keyword: any of name/summary/customer_impact_summary contains
+        one of the configured keywords (case-insensitive)
+    Rule A (routing key) does not apply to FH — those fields are VO-only.
+    """
     conn = sqlite3.connect(DB_PATH)
     try:
         df = pd.read_sql_query(
             """
             SELECT i.incident_id, i.number, i.name, i.severity, i.priority,
                    i.current_milestone, i.incident_type,
+                   i.summary, i.customer_impact_summary, i.tag_list,
                    i.created_at, i.started_at, i.discarded_at,
                    i.time_to_detect_s, i.time_to_acknowledge_s,
                    i.time_to_mitigation_s, i.time_to_resolution_s
@@ -328,12 +342,71 @@ def load_fh_incidents():
         "time_to_mitigation_s", "time_to_resolution_s",
     ):
         df[col.replace("_s", "_min")] = df[col] / 60.0
+
+    # ── Per-row scope match flags ─────────────────────────────────────────
+    import re as _re
+    from lib.config import get_incidents_scope
+    scope = get_incidents_scope()
+
+    member_emails = set(scope["member_emails"])
+    keyword_re = _compile_keywords(scope["keywords"])
+
+    # Rule B — a team member held any role on the incident
+    if not roles.empty and member_emails:
+        touched = (
+            roles.assign(_email=roles["user_email"].fillna("").str.lower())
+            .query("_email in @member_emails")
+            ["incident_id"].unique()
+        )
+        df["match_member"] = df["incident_id"].isin(touched)
+    else:
+        df["match_member"] = False
+
+    # Rule C — keyword regex match
+    text_blob = (
+        df["name"].fillna("") + " \n" +
+        df["summary"].fillna("") + " \n" +
+        df["customer_impact_summary"].fillna("")
+    ).str.lower()
+    if keyword_re:
+        df["match_keyword"] = text_blob.str.contains(keyword_re, regex=True, na=False)
+    else:
+        df["match_keyword"] = False
+
+    # Rule A does not apply to FH incidents (no routing key on this source).
+    df["match_routing"] = False
+
     return df, roles
+
+
+def _compile_keywords(keywords):
+    """Combine a list of regex patterns into a single alternation regex.
+
+    Returns a compiled pattern or None if the list is empty.
+    """
+    import re as _re
+    if not keywords:
+        return None
+    # Each keyword is already lowercased by get_incidents_scope; combine.
+    alt = "|".join(f"(?:{k})" for k in keywords)
+    try:
+        return _re.compile(alt)
+    except _re.error as e:
+        import streamlit as _st
+        _st.warning(f"Invalid keyword regex in config.toml [incidents]: {e}")
+        return None
 
 
 @st.cache_data(ttl=300)
 def load_vo_incidents():
-    """Load VictorOps incidents with derived time-to-ack / time-to-resolve."""
+    """Load VictorOps incidents with derived time-to-ack / time-to-resolve.
+
+    Also computes per-row match flags against the [incidents] scope:
+      - match_routing: routing_key is in the configured routing_keys list
+      - match_member: a configured vo_username appears in paged_users_json,
+        or is the acker/resolver
+      - match_keyword: service / entity_display contains a keyword substring
+    """
     conn = sqlite3.connect(DB_PATH)
     try:
         df = pd.read_sql_query(
@@ -344,6 +417,7 @@ def load_vo_incidents():
                    routing_key, paged_users_json,
                    paged_team_member, responded_by_team, is_test
             FROM fact_vo_incident
+            WHERE is_test = 0
             """,
             conn,
         )
@@ -367,6 +441,44 @@ def load_vo_incidents():
     df["impacted_us"] = (
         (df["paged_team_member"] == 1) | (df["responded_by_team"] == 1)
     )
+
+    # ── Per-row scope match flags ─────────────────────────────────────────
+    from lib.config import get_incidents_scope
+    scope = get_incidents_scope()
+    routing_keys = set(scope["routing_keys"])
+    vo_usernames = set(scope["vo_usernames"])
+    keyword_re = _compile_keywords(scope["keywords"])
+
+    # Rule A — routing key
+    df["match_routing"] = (
+        df["routing_key"].fillna("").str.lower().isin(routing_keys)
+    )
+
+    # Rule B — team member on the page. Check paged_users_json (JSON list)
+    # and the raw acker / resolver strings.
+    def _any_member_in_json(j):
+        if not j or not isinstance(j, str):
+            return False
+        try:
+            users = json.loads(j)
+        except (ValueError, TypeError):
+            return False
+        return any((u or "").lower() in vo_usernames for u in users)
+
+    paged_hit = df["paged_users_json"].apply(_any_member_in_json)
+    acker_hit = df["acker"].fillna("").str.lower().isin(vo_usernames)
+    resolver_hit = df["resolver"].fillna("").str.lower().isin(vo_usernames)
+    df["match_member"] = paged_hit | acker_hit | resolver_hit
+
+    # Rule C — keyword regex match against service + entity_display
+    text_blob = (
+        df["service"].fillna("") + " " + df["entity_display"].fillna("")
+    ).str.lower()
+    if keyword_re:
+        df["match_keyword"] = text_blob.str.contains(keyword_re, regex=True, na=False)
+    else:
+        df["match_keyword"] = False
+
     return df
 
 
@@ -571,6 +683,32 @@ def stat_chart(df, date_col, value_col, group_col, title):
             x=g[date_col], y=g["p90"], mode="lines+markers",
             name=f"{group} — P90",
             line=dict(color=color, dash="dash"),
+        ))
+    fig.update_layout(
+        title=title,
+        xaxis_title="Date",
+        yaxis_title=value_col.replace("_", " ").title(),
+        xaxis_tickformat="%b %d",
+        legend=dict(orientation="h", y=-0.2),
+    )
+    return fig
+
+
+def volume_chart(df, date_col, value_col, group_col, title):
+    """Line chart showing the daily sum of a metric per group."""
+    agg = (
+        df.groupby([date_col, group_col])[value_col]
+        .sum()
+        .reset_index(name="total")
+    )
+    fig = go.Figure()
+    for group in sorted(agg[group_col].unique()):
+        g = agg[agg[group_col] == group]
+        color = COLORS.get(group)
+        fig.add_trace(go.Scatter(
+            x=g[date_col], y=g["total"], mode="lines+markers",
+            name=group,
+            line=dict(color=color),
         ))
     fig.update_layout(
         title=title,
@@ -866,19 +1004,19 @@ def main():
         col1, col2 = st.columns(2)
         with col1:
             st.plotly_chart(
-                stat_chart(
+                volume_chart(
                     team_prs_ranged, "created_date", "files_changed",
                     color_col if not drill_down else "team_name",
-                    "Files Changed (Avg + P90)",
+                    "Files Changed (Daily Total)",
                 ),
                 use_container_width=True,
             )
         with col2:
             st.plotly_chart(
-                stat_chart(
+                volume_chart(
                     team_prs_ranged, "created_date", "total_lines_changed",
                     color_col if not drill_down else "team_name",
-                    "Lines Changed (Avg + P90)",
+                    "Lines Changed (Daily Total)",
                 ),
                 use_container_width=True,
             )
@@ -894,19 +1032,19 @@ def main():
         col3, col4 = st.columns(2)
         with col3:
             st.plotly_chart(
-                stat_chart(
+                volume_chart(
                     review_prs, "review_date", "files_changed",
                     review_color_col if not drill_down else "reviewer_team",
-                    "Files Changed on Reviewed PRs (Avg + P90)",
+                    "Files Changed on Reviewed PRs (Daily Total)",
                 ),
                 use_container_width=True,
             )
         with col4:
             st.plotly_chart(
-                stat_chart(
+                volume_chart(
                     review_prs, "review_date", "total_lines_changed",
                     review_color_col if not drill_down else "reviewer_team",
-                    "Lines Changed on Reviewed PRs (Avg + P90)",
+                    "Lines Changed on Reviewed PRs (Daily Total)",
                 ),
                 use_container_width=True,
             )
@@ -1627,27 +1765,159 @@ def main():
                     hide_index=True, use_container_width=True,
                 )
 
-    # ── Incidents tab (FireHydrant) ────────────────────────────────────────
+    # ── Incidents tab (FireHydrant + VictorOps, team-scoped) ──────────────
 
     with tab_incidents:
-        st.header("Incidents (FireHydrant)")
+        st.header("Incidents (team-scoped)")
         st.caption(
-            "Incident-management records from FireHydrant scoped to the "
-            "configured team. Includes real incidents, drills (GAMEDAY), "
-            "quick-response (QR), and performance-gating events."
+            "FireHydrant incident records plus VictorOps pages, filtered to "
+            "incidents relevant to your teams. An incident qualifies if ANY "
+            "of the three scope rules match (routing key, team-member "
+            "involvement, or keyword). Rules are configured in "
+            "`config.toml` under `[incidents]`."
         )
 
-        if fh.empty:
+        from lib.config import get_incidents_scope
+        scope_cfg = get_incidents_scope()
+
+        with st.expander("Scope filters", expanded=True):
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                apply_routing = st.checkbox(
+                    "🔀 Routing key (VO)",
+                    value=True,
+                    help=(
+                        f"VO routing_key in: "
+                        f"{', '.join(scope_cfg['routing_keys']) or '— none configured'}"
+                    ),
+                )
+            with col2:
+                apply_member = st.checkbox(
+                    "👤 Team member involved",
+                    value=True,
+                    help=(
+                        f"VO paged_users/acker/resolver matches one of "
+                        f"{len(scope_cfg['vo_usernames'])} VO usernames, or "
+                        f"an FH role is held by one of "
+                        f"{len(scope_cfg['member_emails'])} emails."
+                    ),
+                )
+            with col3:
+                apply_keyword = st.checkbox(
+                    "🔎 Keyword match",
+                    value=True,
+                    help=(
+                        f"{len(scope_cfg['keywords'])} keywords matched "
+                        f"substring against VO service / FH name + summary."
+                    ),
+                )
+            st.caption(
+                "All three rules default ON. A row matches if any enabled "
+                "rule fires. Turn rules off to see how much each one "
+                "contributes."
+            )
+
+        # ── Helpers to apply rules ────────────────────────────────────────
+        def _qualifies(row):
+            if apply_routing and row.get("match_routing"):
+                return True
+            if apply_member and row.get("match_member"):
+                return True
+            if apply_keyword and row.get("match_keyword"):
+                return True
+            return False
+
+        def _badges(row):
+            parts = []
+            if apply_member and row.get("match_member"):
+                parts.append("👤")
+            if apply_routing and row.get("match_routing"):
+                parts.append("🔀")
+            if apply_keyword and row.get("match_keyword"):
+                parts.append("🔎")
+            return "".join(parts)
+
+        if fh.empty and vo.empty:
+            st.info(
+                "No VO or FH data yet. Run:\n\n"
+                "```\npython3 firehydrant_etl.py --since 2026-01-01\n"
+                "python3 victorops_etl.py --since 2026-01-01\n```"
+            )
+        elif fh.empty:
             st.info(
                 "No FireHydrant data yet. Run:\n\n"
                 "```\npython3 firehydrant_etl.py --since 2026-01-01\n```"
             )
         else:
-            fh_range = fh[
+            fh_range_all = fh[
                 (fh["started_date"] >= start_date) &
                 (fh["started_date"] <= end_date)
             ].copy()
 
+            # Apply scope filter to FH rows
+            if fh_range_all.empty:
+                fh_range = fh_range_all
+            else:
+                fh_mask = fh_range_all.apply(_qualifies, axis=1)
+                fh_range = fh_range_all[fh_mask].copy()
+
+            # Apply same filter to VO rows for a combined view
+            if vo.empty:
+                vo_range = pd.DataFrame()
+            else:
+                vo_range_all = vo[
+                    (vo["started_date"] >= start_date) &
+                    (vo["started_date"] <= end_date)
+                ].copy()
+                if vo_range_all.empty:
+                    vo_range = vo_range_all
+                else:
+                    vo_mask = vo_range_all.apply(_qualifies, axis=1)
+                    vo_range = vo_range_all[vo_mask].copy()
+
+            # ── Scope summary: how did we get here? ──────────────────────
+            def _exclusive_counts(df_scoped):
+                """Return (member_only, routing_only, keyword_only, overlap)
+                based on the ENABLED rules. Used to explain the filtered set.
+                """
+                if df_scoped.empty:
+                    return 0, 0, 0, 0
+                m = df_scoped["match_member"] & apply_member
+                r = df_scoped["match_routing"] & apply_routing
+                k = df_scoped["match_keyword"] & apply_keyword
+                member_only = (m & ~r & ~k).sum()
+                routing_only = (~m & r & ~k).sum()
+                keyword_only = (~m & ~r & k).sum()
+                overlap = (m.astype(int) + r.astype(int) + k.astype(int) >= 2).sum()
+                return int(member_only), int(routing_only), int(keyword_only), int(overlap)
+
+            fh_mo, fh_ro, fh_ko, fh_ov = _exclusive_counts(fh_range)
+            vo_mo, vo_ro, vo_ko, vo_ov = _exclusive_counts(vo_range)
+
+            s1, s2, s3, s4 = st.columns(4)
+            s1.metric("FH in scope", len(fh_range))
+            s2.metric(
+                "VO in scope", len(vo_range) if not vo_range.empty else 0,
+            )
+            s3.metric(
+                "Keyword-only (not involved)",
+                f"FH {fh_ko} · VO {vo_ko}",
+                help=(
+                    "Incidents matching a keyword but NOT a team member. "
+                    "Signals incidents in your domain where your team "
+                    "wasn't pulled in."
+                ),
+            )
+            s4.metric(
+                "Routing-only (VO, not involved)",
+                vo_ro,
+                help=(
+                    "VO pages on a team routing key where no team member "
+                    "was paged or responded."
+                ),
+            )
+
+            st.subheader("FireHydrant — filtered")
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Incidents", len(fh_range))
             sev_real = fh_range[fh_range["severity"].isin(["S1", "S2", "S3", "S4"])]
@@ -1662,6 +1932,14 @@ def main():
                 "Median TTA",
                 f"{m_tta:.0f} min" if pd.notna(m_tta) else "—",
             )
+
+            if fh_range.empty:
+                st.info(
+                    "No FireHydrant incidents match the current scope "
+                    "filters. Adjust the filters above or widen the "
+                    "sidebar date range. (VO-scoped view below may still "
+                    "have data.)"
+                )
 
             st.subheader("Incidents by Severity over Time")
             daily_sev = (
@@ -1803,25 +2081,82 @@ def main():
                     hide_index=True, use_container_width=True,
                 )
 
-            with st.expander("Recent incidents — raw"):
-                show = fh_range[[
-                    "number", "name", "severity", "current_milestone",
-                    "started_at", "time_to_acknowledge_min",
-                    "time_to_mitigation_min", "time_to_resolution_min",
-                ]].copy()
-                for c in (
-                    "time_to_acknowledge_min", "time_to_mitigation_min",
-                    "time_to_resolution_min",
-                ):
-                    show[c] = show[c].round(1)
-                show.columns = [
-                    "#", "Name", "Severity", "Milestone", "Started",
-                    "TTA (min)", "TTM (min)", "TTR (min)",
-                ]
-                st.dataframe(
-                    show.sort_values("Started", ascending=False),
-                    hide_index=True, use_container_width=True,
+            with st.expander("FireHydrant — raw incidents (filtered)"):
+                if fh_range.empty:
+                    st.info("No FH incidents match the current scope filters.")
+                else:
+                    show = fh_range[[
+                        "number", "name", "severity", "current_milestone",
+                        "started_at", "time_to_acknowledge_min",
+                        "time_to_mitigation_min", "time_to_resolution_min",
+                    ]].copy()
+                    show["Match"] = fh_range.apply(_badges, axis=1).values
+                    for c in (
+                        "time_to_acknowledge_min", "time_to_mitigation_min",
+                        "time_to_resolution_min",
+                    ):
+                        show[c] = show[c].round(1)
+                    show.columns = [
+                        "#", "Name", "Severity", "Milestone", "Started",
+                        "TTA (min)", "TTM (min)", "TTR (min)", "Match",
+                    ]
+                    st.dataframe(
+                        show.sort_values("Started", ascending=False),
+                        hide_index=True, use_container_width=True,
+                    )
+
+            # ── VictorOps view (scope-filtered) ──────────────────────────
+            if not vo_range.empty:
+                st.subheader("VictorOps — filtered pages")
+                st.caption(
+                    "VO pages matching the same scope filters. Useful "
+                    "context because most real incidents start as a VO "
+                    "page before a FireHydrant record is opened."
                 )
+                v1, v2, v3, v4 = st.columns(4)
+                v1.metric("Pages", len(vo_range))
+                v_mtta = vo_range["mtta_minutes"].dropna().median()
+                v2.metric(
+                    "Median MTTA",
+                    f"{v_mtta:.1f} min" if pd.notna(v_mtta) else "—",
+                )
+                v_mttr = vo_range["mttr_minutes"].dropna().median()
+                v3.metric(
+                    "Median MTTR",
+                    f"{v_mttr:.1f} min" if pd.notna(v_mttr) else "—",
+                )
+                top_rk = (
+                    vo_range.groupby("routing_key").size()
+                    .reset_index(name="n")
+                    .sort_values("n", ascending=False)
+                )
+                v4.metric(
+                    "Top routing key",
+                    top_rk.iloc[0]["routing_key"] if not top_rk.empty else "—",
+                    help=(
+                        f"{int(top_rk.iloc[0]['n'])} pages"
+                        if not top_rk.empty else ""
+                    ),
+                )
+
+                with st.expander("VictorOps — raw pages (filtered)"):
+                    show_vo = vo_range[[
+                        "incident_number", "service", "routing_key",
+                        "started_at", "acker", "resolver",
+                        "mtta_minutes", "mttr_minutes", "current_phase",
+                    ]].copy()
+                    show_vo["Match"] = vo_range.apply(_badges, axis=1).values
+                    show_vo["mtta_minutes"] = show_vo["mtta_minutes"].round(1)
+                    show_vo["mttr_minutes"] = show_vo["mttr_minutes"].round(1)
+                    show_vo.columns = [
+                        "#", "Service", "Routing Key", "Started",
+                        "Acker", "Resolver", "MTTA (min)", "MTTR (min)",
+                        "Phase", "Match",
+                    ]
+                    st.dataframe(
+                        show_vo.sort_values("Started", ascending=False),
+                        hide_index=True, use_container_width=True,
+                    )
 
     # ── Throughput vs Load tab ─────────────────────────────────────────────
 
@@ -1832,8 +2167,10 @@ def main():
             "Throughput = merged PRs + Jira issues transitioned to Done "
             "(scoped to issues with a linked PR from our teams). "
             "Support load = ZTCE tickets + Webex asks + FireHydrant "
-            "S1–S4 incidents. A lag peak in the correlation chart would "
-            "suggest the relationship is real; a flat chart means it isn't."
+            "S1–S4 incidents scoped via the Incidents-tab rules "
+            "(team-member role OR keyword match). A lag peak in the "
+            "correlation chart would suggest the relationship is real; "
+            "a flat chart means it isn't."
         )
 
         tvl = load_throughput_load_daily()
