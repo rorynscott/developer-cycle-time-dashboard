@@ -74,6 +74,38 @@ def load_prs():
 
 
 @st.cache_data(ttl=300)
+def load_last_approvals():
+    """Per-PR last APPROVED review timestamp + distinct approver count.
+
+    'First approval' (on fact_pr) is the earliest sign-off, which can be
+    premature — 53% of merged PRs collect more than one approver, and some
+    pick up a CHANGES_REQUESTED after that first approval. The *last* APPROVED
+    event is the closest proxy we have for "fully approved / ready to merge."
+    Caveat: we don't capture branch-protection rules, so this is a proxy, not
+    the exact moment merge became unblocked.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT
+                pr_key,
+                MAX(submitted_at) AS last_approval_at,
+                COUNT(DISTINCT reviewer_login) AS approver_count
+            FROM dim_review
+            WHERE review_state = 'APPROVED'
+            GROUP BY pr_key
+            """,
+            conn,
+        )
+    except (pd.io.sql.DatabaseError, sqlite3.OperationalError):
+        conn.close()
+        return pd.DataFrame(columns=["pr_key", "last_approval_at", "approver_count"])
+    conn.close()
+    return df
+
+
+@st.cache_data(ttl=300)
 def load_task_cycle_times():
     """Load per-Jira-issue cycle time data joined with PR timing."""
     conn = sqlite3.connect(DB_PATH)
@@ -1192,6 +1224,112 @@ def main():
                 "No Jira data available. Run the Jira ETL with --backfill "
                 "to load Jira issues linked to PRs."
             )
+
+        # ── PR-level timing breakdown ──────────────────────────────────────
+        st.divider()
+        group_label = "Author" if drill_down else "Team"
+        st.subheader(f"Pull Request Timing — by {group_label}")
+        st.caption(
+            "PR-level lifecycle straight from GitHub (fact_pr), independent of "
+            "Jira linkage: total open→merge time, time to first **and final** "
+            "approval, open→close time, and comment volume. "
+            "**Final approval** = the *last* APPROVED review (proxy for "
+            "“fully approved / ready to merge”); 53% of merged PRs collect more "
+            "than one approver, so it runs later than first approval. It does "
+            "not account for branch-protection rules, so treat it as a close "
+            "proxy, not the exact unblock moment. Toggle “Show individual user "
+            "breakdown” in the sidebar to switch between team and per-author views."
+        )
+
+        if not team_prs_ranged.empty:
+            prc = team_prs_ranged.copy()
+            prc["hours_to_close"] = (
+                (pd.to_datetime(prc["closed_at"]) - pd.to_datetime(prc["created_at"]))
+                .dt.total_seconds() / 3600
+            )
+
+            # Final approval = last APPROVED review event (proxy for "fully
+            # approved / ready to merge"); see load_last_approvals docstring.
+            last_appr = load_last_approvals()
+            prc = prc.merge(last_appr, on="pr_key", how="left")
+            prc["hours_to_final_approval"] = (
+                (pd.to_datetime(prc["last_approval_at"], utc=True)
+                 - pd.to_datetime(prc["created_at"], utc=True))
+                .dt.total_seconds() / 3600
+            )
+
+            pr_metrics = [
+                ("hours_to_merge", "Total Time (open → merged)", "Hours"),
+                ("hours_to_first_approval", "Time to First Approval", "Hours"),
+                ("hours_to_final_approval", "Time to Final Approval", "Hours"),
+                ("hours_to_close", "Time to Close (open → closed)", "Hours"),
+                ("total_comment_count", "Comments per PR", "Comments"),
+            ]
+            pr_color_map = COLORS if color_col == "team_name" else None
+
+            # Lock a single category order so each group keeps its position
+            # across all four charts (teams in config order; authors by volume).
+            if color_col == "team_name":
+                cat_order = [t for t in TEAMS if t in prc["team_name"].unique()]
+            else:
+                cat_order = (
+                    prc.groupby(color_col)["pr_key"].count()
+                    .sort_values(ascending=False).index.tolist()
+                )
+
+            _cells = []
+            for _row_start in range(0, len(pr_metrics), 2):
+                _cells.extend(st.columns(2))
+
+            for (metric, label, ytitle), cell in zip(pr_metrics, _cells):
+                sub = prc.dropna(subset=[metric, color_col])
+                if sub.empty:
+                    cell.info(f"No data for {label}.")
+                    continue
+                agg = (
+                    sub.groupby(color_col)[metric]
+                    .median()
+                    .reset_index()
+                )
+                figpr = px.bar(
+                    agg, x=color_col, y=metric,
+                    color=color_col,
+                    color_discrete_map=pr_color_map,
+                    category_orders={color_col: cat_order},
+                    title=f"Median {label}",
+                    labels={metric: ytitle, color_col: ""},
+                    text=agg[metric].round(1),
+                )
+                figpr.update_traces(textposition="outside")
+                figpr.update_layout(showlegend=False, xaxis_title="")
+                cell.plotly_chart(figpr, use_container_width=True)
+
+            stat = (
+                prc.groupby(color_col)
+                .agg(
+                    prs=("pr_key", "count"),
+                    med_total=("hours_to_merge", "median"),
+                    med_first=("hours_to_first_approval", "median"),
+                    med_final=("hours_to_final_approval", "median"),
+                    med_close=("hours_to_close", "median"),
+                    med_approvers=("approver_count", "median"),
+                    med_comments=("total_comment_count", "median"),
+                )
+                .reset_index()
+                .sort_values("prs", ascending=False)
+            )
+            for c in ("med_total", "med_first", "med_final", "med_close",
+                      "med_comments"):
+                stat[c] = stat[c].round(1)
+            stat["med_approvers"] = stat["med_approvers"].round(0)
+            stat.columns = [
+                group_label, "PRs", "Median Total Hrs",
+                "Median Hrs to First Approval", "Median Hrs to Final Approval",
+                "Median Hrs to Close", "Median Approvers", "Median Comments",
+            ]
+            st.dataframe(stat, hide_index=True, use_container_width=True)
+        else:
+            st.info("No PR data in this date range.")
 
     # ── Support tab ────────────────────────────────────────────────────────
 
