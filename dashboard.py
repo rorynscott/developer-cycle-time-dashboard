@@ -191,13 +191,24 @@ def load_throughput_load_daily():
       - ztce_created: ZTCE tickets created, scoped to configured support teams
       - webex_asks:   Top-level Webex messages (asks) in our room
       - fh_real:      FireHydrant S1-S4 incidents (drills/gamedays excluded)
+
+    Review burden:
+      - reviews_done: PR reviews submitted by our teams' members (scoped via
+                      dim_author.team_name, same scoping as the Reviewer
+                      drill-down). Hypothesis: more reviewing crowds out
+                      throughput, so this should run inversely to throughput.
     """
     conn = sqlite3.connect(DB_PATH)
 
-    team_list = [
-        t["name"] for t in get_teams()
-    ]
+    teams = get_teams()
+    team_list = [t["name"] for t in teams]
     placeholders = ",".join("?" for _ in team_list)
+
+    # Primary team for the review-burden hypothesis. We look at review
+    # burden "from the Directory side": Directory reviews far more DDAS PRs
+    # (1,263) than DDAS reviews Directory PRs (48), so scoping to the first
+    # configured team captures nearly all the cross-team review flow.
+    primary_team = team_list[0] if team_list else None
 
     # 1. Merged PRs per day
     try:
@@ -278,6 +289,67 @@ def load_throughput_load_daily():
     except (pd.io.sql.DatabaseError, sqlite3.OperationalError):
         webex_asks = pd.DataFrame(columns=["d", "webex_asks"])
 
+    # 4b. Review burden: primary team's reviews on PRs NOT authored by the
+    #     primary team (self-team reviews excluded so we don't correlate the
+    #     team's own PRs against itself). This counts DDAS + external PRs the
+    #     Directory team reviews — the "pure cost" review work.
+    reviews_done = pd.DataFrame(columns=["d", "reviews_done"])
+    if primary_team:
+        try:
+            reviews_done = pd.read_sql_query(
+                """
+                SELECT DATE(r.submitted_at) AS d, COUNT(*) AS reviews_done
+                FROM dim_review r
+                JOIN dim_author ra ON r.reviewer_login = ra.author_login
+                JOIN fact_pr p ON r.pr_key = p.pr_key
+                LEFT JOIN dim_author pa ON p.author_login = pa.author_login
+                WHERE ra.team_name = ?
+                  AND r.submitted_at IS NOT NULL
+                  AND (pa.team_name IS NULL OR pa.team_name != ?)
+                GROUP BY DATE(r.submitted_at)
+                """,
+                conn, params=(primary_team, primary_team),
+            )
+        except (pd.io.sql.DatabaseError, sqlite3.OperationalError):
+            pass
+
+    # 4c. Primary-team-only throughput, so the review-burden correlation is
+    #     apples-to-apples (the team's review cost vs the team's own output).
+    primary_merged = pd.DataFrame(columns=["d", "primary_merged_prs"])
+    primary_jira = pd.DataFrame(columns=["d", "primary_jira_done"])
+    if primary_team:
+        try:
+            primary_merged = pd.read_sql_query(
+                """
+                SELECT DATE(merged_at) AS d, COUNT(*) AS primary_merged_prs
+                FROM fact_pr
+                WHERE team_name = ? AND merged_at IS NOT NULL
+                GROUP BY DATE(merged_at)
+                """,
+                conn, params=(primary_team,),
+            )
+        except (pd.io.sql.DatabaseError, sqlite3.OperationalError):
+            pass
+        try:
+            primary_jira = pd.read_sql_query(
+                """
+                SELECT DATE(sc.changed_at) AS d,
+                       COUNT(DISTINCT sc.issue_key) AS primary_jira_done
+                FROM dim_jira_status_change sc
+                WHERE sc.to_status IN ('Done','Closed','Resolved')
+                  AND sc.issue_key IN (
+                    SELECT DISTINCT b.jira_key
+                    FROM bridge_pr_jira b
+                    JOIN fact_pr p ON b.pr_key = p.pr_key
+                    WHERE p.team_name = ?
+                  )
+                GROUP BY DATE(sc.changed_at)
+                """,
+                conn, params=(primary_team,),
+            )
+        except (pd.io.sql.DatabaseError, sqlite3.OperationalError):
+            pass
+
     conn.close()
 
     # 5. FireHydrant S1-S4 per day, scoped to incidents where a team
@@ -302,7 +374,8 @@ def load_throughput_load_daily():
 
     # Outer-join everything on date
     import functools
-    frames = [prs, jira_done, ztce, webex_asks, fh_real]
+    frames = [prs, jira_done, ztce, webex_asks, fh_real, reviews_done,
+              primary_merged, primary_jira]
     frames = [f for f in frames if not f.empty]
     if not frames:
         return pd.DataFrame()
@@ -314,7 +387,9 @@ def load_throughput_load_daily():
     out["d"] = pd.to_datetime(out["d"]).dt.date
     out = out.sort_values("d").reset_index(drop=True)
     # Integer columns
-    for col in ("merged_prs", "jira_done", "ztce_created", "webex_asks", "fh_real"):
+    for col in ("merged_prs", "jira_done", "ztce_created", "webex_asks",
+                "fh_real", "reviews_done", "primary_merged_prs",
+                "primary_jira_done"):
         if col in out.columns:
             out[col] = out[col].astype(int)
         else:
@@ -323,6 +398,10 @@ def load_throughput_load_daily():
     # Composites
     out["throughput"] = out["merged_prs"] + out["jira_done"]
     out["support_load"] = out["ztce_created"] + out["webex_asks"] + out["fh_real"]
+    out["review_burden"] = out["reviews_done"]
+    # Primary-team-only throughput, paired with review_burden in the
+    # hypothesis correlation below.
+    out["primary_throughput"] = out["primary_merged_prs"] + out["primary_jira_done"]
     return out
 
 
@@ -839,9 +918,11 @@ def main():
     # ── Tabs ───────────────────────────────────────────────────────────────
 
     (tab_overview, tab_reviews, tab_pr_size, tab_cycle_time,
-     tab_support, tab_oncall, tab_incidents, tab_tvl) = st.tabs(
+     tab_support, tab_oncall, tab_incidents, tab_tvl,
+     tab_trb) = st.tabs(
         ["Overview", "Reviews", "PR Size", "Cycle Time",
-         "Support", "On-Call", "Incidents", "Throughput vs Load"]
+         "Support", "On-Call", "Incidents", "Throughput vs Load",
+         "Throughput vs Review Burden"]
     )
 
     # ── Overview tab ───────────────────────────────────────────────────────
@@ -2482,6 +2563,174 @@ def main():
                         ))
                     fig_ratio.update_layout(xaxis_tickformat="%b %d")
                     st.plotly_chart(fig_ratio, use_container_width=True)
+
+    # ── Throughput vs Review Burden tab ─────────────────────────────────────
+    #     Entirely scoped to the primary team (Directory) so we never mix
+    #     data lenses: Directory's own throughput vs Directory's reviews on
+    #     OTHER teams' PRs. Tests the hypothesis that heavy cross-team review
+    #     weeks crowd out Directory's own delivery.
+
+    with tab_trb:
+        _teams = get_teams()
+        _primary_team = _teams[0] if _teams else {"name": "the team"}
+        primary_label = _primary_team.get("short_name") or _primary_team["name"]
+
+        st.header(f"Throughput vs Review Burden — {primary_label}")
+        st.caption(
+            f"Everything on this tab is scoped to **{primary_label} only**. "
+            f"Throughput = {primary_label}'s merged PRs + Jira issues "
+            "transitioned to Done (linked to a "
+            f"{primary_label} PR). Review burden = {primary_label} reviews on "
+            "PRs authored by OTHER teams (self-team reviews excluded, so the "
+            "two series share no PRs). Hypothesis: heavy cross-team review "
+            f"weeks crowd out {primary_label}'s own delivery."
+        )
+
+        trb = load_throughput_load_daily()
+        if trb.empty:
+            st.info("Not enough data yet — run the ETLs first.")
+        else:
+            trb_range = trb[
+                (trb["d"] >= start_date) & (trb["d"] <= end_date)
+            ].copy()
+
+            if trb_range.empty:
+                st.info("No data in the selected date range.")
+            else:
+                trb_weekly = trb_range.copy()
+                trb_weekly["week"] = (
+                    pd.to_datetime(trb_weekly["d"])
+                    .dt.to_period("W-MON").dt.start_time
+                )
+                rweekly = trb_weekly.groupby("week").agg({
+                    "primary_merged_prs": "sum",
+                    "primary_jira_done": "sum",
+                    "reviews_done": "sum",
+                    "primary_throughput": "sum",
+                    "review_burden": "sum",
+                }).reset_index()
+
+                def _indexed(series):
+                    m = series.mean()
+                    return (series / m * 100) if m else series
+
+                rweekly["throughput_idx"] = _indexed(rweekly["primary_throughput"])
+                rweekly["review_idx"] = _indexed(rweekly["review_burden"])
+
+                # ── Indexed trend ─────────────────────────────────────────
+                st.subheader("Weekly Indexed Trend")
+                st.caption(
+                    "Both series indexed to 100 at their own mean so they're "
+                    "comparable despite different magnitudes. If the "
+                    "hypothesis holds, the lines should tend to move in "
+                    "opposite directions."
+                )
+                fig_idx = go.Figure()
+                fig_idx.add_trace(go.Scatter(
+                    x=rweekly["week"], y=rweekly["throughput_idx"],
+                    mode="lines+markers",
+                    name=f"{primary_label} throughput (PRs + Jira done)",
+                    line=dict(color="#636EFA", width=2),
+                ))
+                fig_idx.add_trace(go.Scatter(
+                    x=rweekly["week"], y=rweekly["review_idx"],
+                    mode="lines+markers",
+                    name=f"Review burden ({primary_label} → other teams)",
+                    line=dict(color="#00CC96", width=2),
+                ))
+                fig_idx.add_hline(y=100, line_dash="dot", line_color="#888",
+                                  annotation_text="avg")
+                fig_idx.update_layout(
+                    yaxis_title="Indexed (100 = average)",
+                    xaxis_tickformat="%b %d",
+                    legend=dict(orientation="h", y=-0.2),
+                )
+                st.plotly_chart(fig_idx, use_container_width=True)
+
+                # ── Weekly totals ─────────────────────────────────────────
+                st.subheader("Weekly Totals (raw)")
+                st.caption("Absolute counts behind the indexed view above.")
+                rdisp = rweekly[[
+                    "week", "primary_merged_prs", "primary_jira_done",
+                    "primary_throughput", "review_burden",
+                ]].copy()
+                rdisp["week"] = pd.to_datetime(rdisp["week"]).dt.strftime("%Y-%m-%d")
+                rdisp.columns = [
+                    "Week", "Merged PRs", "Jira Done", "Throughput",
+                    "Review Burden",
+                ]
+                st.dataframe(rdisp, hide_index=True, use_container_width=True)
+
+                # ── Concurrent correlation (the hypothesis test) ──────────
+                st.subheader("Review Burden vs Throughput (same week)")
+                st.caption(
+                    "Review work here is largely just-in-time, so we compare "
+                    "review burden and throughput in the **same week** (no "
+                    "lag). Pearson r measures direction and strength; r² is "
+                    "the share of week-to-week throughput variation that "
+                    "tracks with review burden. A negative r supports 'more "
+                    "reviews → less throughput'."
+                )
+                paired = rweekly[["review_burden", "primary_throughput"]].dropna()
+                n_weeks = len(paired)
+                if n_weeks < 4:
+                    st.warning(
+                        f"Only {n_weeks} weeks of data in range — too few to "
+                        f"compute a meaningful correlation. Widen the date "
+                        f"range."
+                    )
+                else:
+                    r = paired["review_burden"].corr(paired["primary_throughput"])
+                    r2 = r ** 2
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Pearson r", f"{r:+.2f}")
+                    m2.metric("r²", f"{r2:.2f}")
+                    m3.metric("Weeks (n)", f"{n_weeks}")
+
+                    if n_weeks < 12:
+                        st.warning(
+                            f"Only {n_weeks} weeks of data in range — "
+                            f"suggestive at best. Widen the date range for "
+                            f"more robust signal."
+                        )
+                    elif r > -0.3:
+                        st.warning(
+                            "No meaningful negative correlation (r > -0.3). "
+                            "The data does not support the 'more reviews → "
+                            "less throughput' hypothesis in this range."
+                        )
+                    elif r > -0.5:
+                        st.info(
+                            "Modest negative correlation. Suggestive that "
+                            "review burden trades against throughput, but "
+                            "inconclusive — gather more history."
+                        )
+                    else:
+                        st.success(
+                            f"Meaningful negative correlation (r={r:+.2f}, "
+                            f"r²={r2:.2f}) — busy review weeks coincide with "
+                            f"lower throughput."
+                        )
+
+                    # Scatter so the relationship is visible, not just a number
+                    fig_sc = px.scatter(
+                        paired, x="review_burden", y="primary_throughput",
+                        labels={
+                            "review_burden": "Weekly review burden",
+                            "primary_throughput": f"{primary_label} weekly throughput",
+                        },
+                    )
+                    # Least-squares fit line (np.polyfit; statsmodels not a dep)
+                    xv = paired["review_burden"].values.astype(float)
+                    yv = paired["primary_throughput"].values.astype(float)
+                    coeffs = np.polyfit(xv, yv, 1)
+                    xline = np.array([xv.min(), xv.max()])
+                    fig_sc.add_trace(go.Scatter(
+                        x=xline, y=np.polyval(coeffs, xline),
+                        mode="lines", name="Fit",
+                        line=dict(color="#888", width=2, dash="dash"),
+                    ))
+                    st.plotly_chart(fig_sc, use_container_width=True)
 
     # ── Drill-down tables ───────────────────────────────────────────────────
 
