@@ -336,6 +336,7 @@ def transform_pr(pr_list_item, detail, reviews, issue_comments, commits):
         "first_review_at": iso_str(first_review_at),
         "first_approval_at": iso_str(first_approval_at),
         "merged_at": iso_str(merged_at),
+        "merged_by": ((detail or {}).get("merged_by") or {}).get("login"),
         "closed_at": iso_str(closed_at),
         "hours_to_first_review": hours_between(created_at, first_review_at),
         "hours_to_first_approval": hours_between(created_at, first_approval_at),
@@ -398,6 +399,7 @@ DDL_STATEMENTS = [
         first_review_at     TEXT,
         first_approval_at   TEXT,
         merged_at           TEXT,
+        merged_by           TEXT,
         closed_at           TEXT,
         hours_to_first_review   REAL,
         hours_to_first_approval REAL,
@@ -477,6 +479,9 @@ def ensure_tables(conn):
     if "jira_keys" not in columns:
         conn.execute("ALTER TABLE fact_pr ADD COLUMN jira_keys TEXT")
         log("  Migrated: added jira_keys column to fact_pr")
+    if "merged_by" not in columns:
+        conn.execute("ALTER TABLE fact_pr ADD COLUMN merged_by TEXT")
+        log("  Migrated: added merged_by column to fact_pr")
     cur = conn.execute("PRAGMA table_info(dim_author)")
     if "left_on" not in {row[1] for row in cur.fetchall()}:
         conn.execute("ALTER TABLE dim_author ADD COLUMN left_on TEXT")
@@ -544,7 +549,7 @@ def upsert_fact_pr(conn, record):
             pr_key, pr_number, repo_key, author_login, team_name,
             title, state, is_draft, base_branch, head_branch, labels,
             created_at, updated_at, first_review_at, first_approval_at,
-            merged_at, closed_at, hours_to_first_review,
+            merged_at, merged_by, closed_at, hours_to_first_review,
             hours_to_first_approval, hours_to_merge,
             review_comment_count, issue_comment_count, total_comment_count,
             files_changed, lines_added, lines_removed, total_lines_changed,
@@ -554,7 +559,7 @@ def upsert_fact_pr(conn, record):
         ) VALUES (
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-            ?, ?, ?
+            ?, ?, ?, ?
         )
         """,
         (
@@ -564,7 +569,7 @@ def upsert_fact_pr(conn, record):
             record["base_branch"], record["head_branch"], record["labels"],
             record["created_at"], record["updated_at"],
             record["first_review_at"], record["first_approval_at"],
-            record["merged_at"], record["closed_at"],
+            record["merged_at"], record["merged_by"], record["closed_at"],
             record["hours_to_first_review"], record["hours_to_first_approval"],
             record["hours_to_merge"], record["review_comment_count"],
             record["issue_comment_count"], record["total_comment_count"],
@@ -577,6 +582,32 @@ def upsert_fact_pr(conn, record):
             record["review_status"], now,
         ),
     )
+
+
+def backfill_merged_by(conn, token):
+    """Fill merged_by for merged PRs loaded before the column existed.
+
+    One detail call per PR. Resumable: only rows still NULL are fetched.
+    """
+    rows = conn.execute(
+        "SELECT pr_key, repo_key, pr_number FROM fact_pr "
+        "WHERE merged_at IS NOT NULL AND merged_by IS NULL "
+        "ORDER BY merged_at DESC"
+    ).fetchall()
+    log(f"Backfilling merged_by for {len(rows)} merged PRs...")
+    for i, (pr_key, repo, number) in enumerate(rows, 1):
+        detail = fetch_pr_detail(token, repo, number)
+        login = ((detail or {}).get("merged_by") or {}).get("login")
+        if login:
+            with_db_retry(lambda: conn.execute(
+                "UPDATE fact_pr SET merged_by = ? WHERE pr_key = ?",
+                (login, pr_key),
+            ))
+        if i % 100 == 0:
+            with_db_retry(conn.commit)
+            log(f"  {i}/{len(rows)}")
+    with_db_retry(conn.commit)
+    log("  merged_by backfill done.")
 
 
 def upsert_dim_reviews(conn, pr_key, review_records):
@@ -609,6 +640,9 @@ def main():
                         help="Include all authors (default: team involvement only)")
     parser.add_argument("--verbose", action="store_true",
                         help="Extra logging")
+    parser.add_argument("--backfill-merged-by", action="store_true",
+                        help="Fill merged_by for already-loaded merged PRs, "
+                             "then exit")
     args = parser.parse_args()
 
     cfg = load_config()
@@ -625,6 +659,10 @@ def main():
         ensure_tables(db_conn)
         seed_dimensions(db_conn)
         reattribute_prs(db_conn)
+        if args.backfill_merged_by:
+            backfill_merged_by(db_conn, gh_token)
+            db_conn.close()
+            return
 
     # Determine date range
     if args.since:
