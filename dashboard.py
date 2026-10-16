@@ -22,7 +22,7 @@ import streamlit as st
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lib.config import (
-    load_config, get_teams, get_team_names, get_team_colors,
+    load_config, get_teams, get_team_names, get_team_colors, get_team_resolver,
     get_db_path, get_dashboard_title, get_dashboard_default_days,
     get_jira_support_config, get_github_issues_config,
 )
@@ -53,7 +53,7 @@ def load_prs():
             """
             SELECT
                 pr_key, pr_number, repo_key, author_login, team_name, title,
-                state, is_draft, created_at, merged_at, closed_at,
+                state, is_draft, created_at, merged_at, merged_by, closed_at,
                 hours_to_first_review, hours_to_first_approval, hours_to_merge,
                 review_comment_count, issue_comment_count, total_comment_count,
                 files_changed, lines_added, lines_removed, total_lines_changed,
@@ -101,6 +101,35 @@ def load_last_approvals():
     except (pd.io.sql.DatabaseError, sqlite3.OperationalError):
         conn.close()
         return pd.DataFrame(columns=["pr_key", "last_approval_at", "approver_count"])
+    conn.close()
+    return df
+
+
+@st.cache_data(ttl=300)
+def load_ready_for_merger():
+    """Per merged PR: the last APPROVED review by someone other than the
+    person who merged it ("ready, waiting for a merger").
+
+    Final approval alone hides merge dependency: a restricted merger often
+    approves and merges in one sitting, so final-approval → merge is ~0 even
+    when the PR waited days for them after the team signed off.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT r.pr_key, MAX(r.submitted_at) AS ready_at
+            FROM dim_review r
+            JOIN fact_pr p ON r.pr_key = p.pr_key
+            WHERE r.review_state = 'APPROVED'
+              AND p.merged_by IS NOT NULL
+              AND r.reviewer_login != p.merged_by
+            GROUP BY r.pr_key
+            """,
+            conn,
+        )
+    except (pd.io.sql.DatabaseError, sqlite3.OperationalError):
+        df = pd.DataFrame(columns=["pr_key", "ready_at"])
     conn.close()
     return df
 
@@ -827,6 +856,181 @@ def load_reviews():
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
+
+
+# Merger categories, validated (dataviz validate_palette.js) against
+# Streamlit's light (#ffffff) and dark (#0e1117) surfaces; each mode gets its
+# own steps. Light aqua is <3:1 on white, so segments carry direct labels.
+MERGER_ORDER = ["Self", "Teammate", "Outside team"]
+MERGER_COLORS = {
+    "light": {"Teammate": "#2a78d6", "Outside team": "#eb6834", "Self": "#1baf7a"},
+    "dark": {"Teammate": "#3987e5", "Outside team": "#d95926", "Self": "#199e70"},
+}
+CHART_SURFACE = {"light": "#ffffff", "dark": "#0e1117"}
+
+
+def _theme_mode():
+    theme = getattr(st.context, "theme", None)
+    return "dark" if theme is not None and theme.type == "dark" else "light"
+
+
+def render_merge_dependency(team_prs_ranged):
+    """Who merges the team's PRs, per repo, and how long PRs wait for them.
+
+    Matters for repos where only a restricted group can merge (e.g. a
+    merge-rights team): the team's delivery then depends on outsiders.
+    """
+    st.subheader("Who Merges Our PRs")
+    st.caption(
+        "Merged team PRs (created in range) by who clicked merge: the author "
+        "(**Self**), another member of the author's team at merge time "
+        "(**Teammate**), or anyone else (**Outside team**). Compare **open → "
+        "merge** within a repo, not across repos. **Wait** = last approval by someone "
+        "*other than the merger* → merge (how long a signed-off PR sat "
+        "waiting for its merger); it only exists when someone besides the "
+        "merger approved. Restricted mergers are often the sole reviewer, "
+        "so check *PRs with wait data* before reading the wait columns."
+    )
+
+    merged = team_prs_ranged[
+        team_prs_ranged["merged_at"].notna() & team_prs_ranged["merged_by"].notna()
+    ].copy() if not team_prs_ranged.empty else team_prs_ranged
+    if merged.empty:
+        st.info("No merged PRs with merger data in this date range.")
+        return
+
+    team_at = get_team_resolver()
+    merged["merger"] = [
+        "Self" if by == author
+        else "Teammate" if team_at(by, at) == team
+        else "Outside team"
+        for by, author, at, team in zip(
+            merged["merged_by"], merged["author_login"],
+            merged["merged_at"], merged["team_name"],
+        )
+    ]
+    merged["repo"] = merged["repo_key"].str.split("/").str[-1]
+    merged = merged.merge(load_ready_for_merger(), on="pr_key", how="left")
+    merged["wait_hours"] = (
+        (pd.to_datetime(merged["merged_at"], utc=True)
+         - pd.to_datetime(merged["ready_at"], utc=True))
+        .dt.total_seconds() / 3600
+    )
+    # Approvals after the merge (post-hoc reviews) have no meaningful wait;
+    # leave them out of the wait stats.
+    merged.loc[merged["wait_hours"] < 0, "wait_hours"] = np.nan
+
+    outside = merged[merged["merger"] == "Outside team"]
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Merged PRs", len(merged))
+    k2.metric("Merged by outside team", f"{len(outside) / len(merged):.0%}")
+    if not outside.empty:
+        top = outside["merged_by"].value_counts()
+        k3.metric(
+            "Top outside merger", top.index[0],
+            f"{top.iloc[0] / len(outside):.0%} of outside merges",
+            delta_color="off", delta_arrow="off",
+        )
+    else:
+        k3.metric("Top outside merger", "—")
+    # Per-repo, not pooled: self-merge and outside-merge happen in different
+    # repos, so a pooled open→merge comparison would mostly compare repos.
+    repo_outside = (merged["merger"] == "Outside team").groupby(merged["repo"]).mean()
+    dependent = sorted(repo_outside[repo_outside > 0.5].index)
+    k4.metric(
+        "Repos mostly merged by outsiders",
+        f"{len(dependent)} of {len(repo_outside)}",
+        ", ".join(dependent) or None,
+        delta_color="off", delta_arrow="off",
+    )
+
+    mode = _theme_mode()
+    colors = MERGER_COLORS[mode]
+    surface = CHART_SURFACE[mode]
+
+    left, right = st.columns(2)
+
+    # Part-to-whole per repo: 100% stacked horizontal bars
+    share = (
+        merged.groupby(["repo", "merger"]).size().reset_index(name="prs")
+    )
+    share["pct"] = share["prs"] / share.groupby("repo")["prs"].transform("sum")
+    repo_order = (
+        merged.groupby("repo").size().sort_values(ascending=True).index.tolist()
+    )
+    fig_share = px.bar(
+        share, y="repo", x="pct", color="merger", orientation="h",
+        color_discrete_map=colors,
+        category_orders={"merger": MERGER_ORDER, "repo": repo_order},
+        custom_data=["prs"],
+        text=share["pct"].map(lambda v: f"{v:.0%}" if v >= 0.08 else ""),
+        title="Share of merged PRs by merger, per repo",
+        labels={"repo": "", "pct": "", "merger": ""},
+    )
+    fig_share.update_traces(
+        marker_line_color=surface, marker_line_width=2,
+        textposition="inside", insidetextanchor="middle",
+        hovertemplate="%{y} · %{fullData.name}<br>"
+                      "%{customdata[0]} PRs (%{x:.0%})<extra></extra>",
+    )
+    fig_share.update_layout(
+        barmode="stack", bargap=0.35, barcornerradius=4,
+        xaxis=dict(tickformat=".0%", range=[0, 1.001], showgrid=False,
+                   tickvals=[0, 0.25, 0.5, 0.75, 1]),
+        legend=dict(orientation="h", y=-0.15, traceorder="normal"),
+    )
+    left.plotly_chart(fig_share, use_container_width=True)
+
+    # Ranked outside mergers, single series
+    if outside.empty:
+        right.info("No PRs merged by people outside the team in this range.")
+    else:
+        top_out = (
+            outside.groupby("merged_by")
+            .agg(prs=("pr_key", "count"),
+                 repos=("repo", lambda r: ", ".join(sorted(set(r)))))
+            .reset_index()
+            .sort_values("prs", ascending=False)
+            .head(10)
+            .sort_values("prs")
+        )
+        fig_top = px.bar(
+            top_out, y="merged_by", x="prs", orientation="h",
+            custom_data=["repos"], text="prs",
+            title="Top outside mergers of our PRs",
+            labels={"merged_by": "", "prs": "PRs merged"},
+        )
+        fig_top.update_traces(
+            marker_color=colors["Outside team"],
+            textposition="outside",
+            hovertemplate="%{y}: %{x} PRs<br>%{customdata[0]}<extra></extra>",
+        )
+        fig_top.update_layout(bargap=0.35, barcornerradius=4,
+                              xaxis=dict(showgrid=False))
+        right.plotly_chart(fig_top, use_container_width=True)
+
+    # Table view: wait for a merger, per repo and merger type
+    wait = (
+        merged.groupby(["repo", "merger"])
+        .agg(
+            prs=("pr_key", "count"),
+            med_open=("hours_to_merge", "median"),
+            n_wait=("wait_hours", "count"),
+            med_wait=("wait_hours", "median"),
+            p90_wait=("wait_hours", lambda w: w.quantile(0.9)),
+        )
+        .reset_index()
+    )
+    wait["merger"] = pd.Categorical(wait["merger"], MERGER_ORDER, ordered=True)
+    wait = wait.sort_values(["repo", "merger"])
+    for c in ("med_open", "med_wait", "p90_wait"):
+        wait[c] = wait[c].round(1)
+    wait.columns = [
+        "Repo", "Merged by", "PRs", "Median open → merge (h)",
+        "PRs with wait data",
+        "Median wait (h)", "P90 wait (h)",
+    ]
+    st.dataframe(wait, hide_index=True, use_container_width=True)
 
 
 def filter_by_date(df, date_col, start, end):
@@ -1621,6 +1825,10 @@ def main():
             st.dataframe(stat, hide_index=True, use_container_width=True)
         else:
             st.info("No PR data in this date range.")
+
+        # ── Who merges our PRs ──────────────────────────────────────────────
+        st.divider()
+        render_merge_dependency(team_prs_ranged)
 
     # ── Support tab ────────────────────────────────────────────────────────
 
