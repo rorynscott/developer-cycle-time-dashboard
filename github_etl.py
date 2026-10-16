@@ -12,6 +12,7 @@ Usage:
     python3 github_etl.py --since 2026-01-01 --until 2026-01-31  # date range
     python3 github_etl.py --dry-run --verbose      # preview without writing
     python3 github_etl.py --all-authors             # don't filter by team involvement
+    python3 github_etl.py --since 2026-07-09 --repos org/a,org/b  # subset re-run
 """
 
 import json
@@ -30,7 +31,9 @@ from datetime import datetime, timezone, timedelta
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lib.config import (
-    load_config, get_team_lookup, get_team_members, get_github_token,
+    load_config, get_team_lookup, get_team_members, get_team_resolver,
+    get_former_members,
+    get_github_token,
     get_db_path,
 )
 from lib.db import log, is_error, get_db_connection, with_db_retry
@@ -39,6 +42,7 @@ from lib.db import log, is_error, get_db_connection, with_db_retry
 
 TEAM_LOOKUP = get_team_lookup()
 ALL_TEAM_MEMBERS = get_team_members()
+TEAM_AT = get_team_resolver()
 
 JIRA_KEY_RE = re.compile(r"(?<![A-Za-z])([A-Z][A-Z0-9]+-\d+)(?=\b|[_/\s]|$)")
 
@@ -124,7 +128,7 @@ def fetch_prs_in_range(token, repo, since_iso, until_iso=None):
 
 def has_team_involvement(pr):
     """Check if a team member is the author or a requested reviewer."""
-    author = pr.get("user", {}).get("login", "")
+    author = (pr.get("user") or {}).get("login", "")
     if author in ALL_TEAM_MEMBERS:
         return True
     for reviewer in pr.get("requested_reviewers", []):
@@ -198,7 +202,7 @@ def fetch_pr_commits(token, repo, number):
 def reviews_have_team_member(reviews):
     """Check if any team member submitted a review."""
     for r in reviews:
-        login = r.get("user", {}).get("login", "")
+        login = (r.get("user") or {}).get("login", "")
         if login in ALL_TEAM_MEMBERS:
             return True
     return False
@@ -231,7 +235,7 @@ def compute_review_status(reviews):
         return "REVIEW_REQUIRED"
     latest_by_user = {}
     for review in reviews:
-        user = review.get("user", {}).get("login", "")
+        user = (review.get("user") or {}).get("login", "")
         state = review.get("state", "")
         if state in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
             latest_by_user[user] = state
@@ -249,7 +253,7 @@ def detect_ai_coauthor(commits, pr_body=""):
     tools_found = set()
     texts = [pr_body or ""]
     for c in commits:
-        msg = c.get("commit", {}).get("message", "")
+        msg = (c.get("commit") or {}).get("message", "")
         texts.append(msg)
     full_text = "\n".join(texts)
     for pattern, tool_name in AI_COAUTHOR_PATTERNS:
@@ -269,7 +273,7 @@ def extract_reviewers(reviews):
     reviewers = set()
     for r in reviews:
         state = r.get("state", "")
-        login = r.get("user", {}).get("login", "")
+        login = (r.get("user") or {}).get("login", "")
         if login and state in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
             reviewers.add(login)
     return sorted(reviewers)
@@ -279,7 +283,7 @@ def transform_pr(pr_list_item, detail, reviews, issue_comments, commits):
     repo = pr_list_item.get("base", {}).get("repo", {}).get("full_name", "")
     number = pr_list_item["number"]
     pr_key = f"{repo}#{number}"
-    author = pr_list_item["user"]["login"]
+    author = (pr_list_item.get("user") or {}).get("login", "")
 
     created_at = parse_iso(pr_list_item["created_at"])
 
@@ -320,7 +324,7 @@ def transform_pr(pr_list_item, detail, reviews, issue_comments, commits):
         "pr_number": number,
         "repo_key": repo,
         "author_login": author,
-        "team_name": TEAM_LOOKUP.get(author),
+        "team_name": TEAM_AT(author, merged_at or closed_at),
         "title": (pr_list_item.get("title") or "")[:2000],
         "state": state,
         "is_draft": pr_list_item.get("draft", False),
@@ -366,7 +370,7 @@ def transform_reviews(pr_key, reviews):
         records.append({
             "review_key": f"{pr_key}#{review_id}",
             "pr_key": pr_key,
-            "reviewer_login": r.get("user", {}).get("login", ""),
+            "reviewer_login": (r.get("user") or {}).get("login", ""),
             "review_state": state,
             "submitted_at": iso_str(parse_iso(r.get("submitted_at"))),
         })
@@ -417,7 +421,8 @@ DDL_STATEMENTS = [
     CREATE TABLE IF NOT EXISTS dim_author (
         author_login    TEXT PRIMARY KEY,
         team_name       TEXT,
-        is_tracked      INTEGER DEFAULT 0
+        is_tracked      INTEGER DEFAULT 0,
+        left_on         TEXT
     )
     """,
     """
@@ -472,6 +477,10 @@ def ensure_tables(conn):
     if "jira_keys" not in columns:
         conn.execute("ALTER TABLE fact_pr ADD COLUMN jira_keys TEXT")
         log("  Migrated: added jira_keys column to fact_pr")
+    cur = conn.execute("PRAGMA table_info(dim_author)")
+    if "left_on" not in {row[1] for row in cur.fetchall()}:
+        conn.execute("ALTER TABLE dim_author ADD COLUMN left_on TEXT")
+        log("  Migrated: added left_on column to dim_author")
     conn.commit()
     log("  Tables ensured.")
 
@@ -485,15 +494,46 @@ def seed_dimensions(conn):
             "VALUES (?, ?, ?)",
             (repo, owner, name),
         )
-    for team_name, members in [(t["name"], t["members"]) for t in cfg["teams"]]:
-        for login in members:
-            conn.execute(
-                "INSERT OR REPLACE INTO dim_author (author_login, team_name, is_tracked) "
-                "VALUES (?, ?, 1)",
-                (login, team_name),
-            )
+    # Untrack anyone dropped from the roster entirely, then (re)seed current
+    # and former members. Former members carry left_on so review queries can
+    # stop counting them after they left.
+    lookup = get_team_lookup()
+    former = get_former_members()
+    placeholders = ",".join("?" for _ in lookup)
+    conn.execute(
+        f"UPDATE dim_author SET team_name = NULL, is_tracked = 0, left_on = NULL "
+        f"WHERE is_tracked = 1 AND author_login NOT IN ({placeholders})",
+        list(lookup),
+    )
+    for login, team_name in lookup.items():
+        conn.execute(
+            "INSERT OR REPLACE INTO dim_author "
+            "(author_login, team_name, is_tracked, left_on) VALUES (?, ?, 1, ?)",
+            (login, team_name, former.get(login)),
+        )
     conn.commit()
     log("  Dimensions seeded.")
+
+
+def reattribute_prs(conn):
+    """Recompute fact_pr.team_name for every PR from the current roster.
+
+    Team membership changes (merges, departures) then apply to history
+    without a re-fetch. A PR belongs to its author's team as of when it
+    merged/closed; open PRs use the author's current team.
+    """
+    rows = conn.execute(
+        "SELECT pr_key, author_login, COALESCE(merged_at, closed_at), team_name "
+        "FROM fact_pr"
+    ).fetchall()
+    changes = [
+        (new, pr_key) for pr_key, author, finished, old in rows
+        if (new := TEAM_AT(author, finished)) != old
+    ]
+    conn.executemany("UPDATE fact_pr SET team_name = ? WHERE pr_key = ?", changes)
+    conn.commit()
+    if changes:
+        log(f"  Re-attributed {len(changes)} PRs to current team roster.")
 
 
 def upsert_fact_pr(conn, record):
@@ -560,6 +600,9 @@ def main():
                         help="Start date (YYYY-MM-DD). Overrides watermark.")
     parser.add_argument("--until", type=str,
                         help="End date (YYYY-MM-DD). Defaults to now.")
+    parser.add_argument("--repos", type=str,
+                        help="Comma-separated repo subset (org/repo); "
+                             "does not advance the watermark")
     parser.add_argument("--dry-run", action="store_true",
                         help="Extract and transform only, no DB writes")
     parser.add_argument("--all-authors", action="store_true",
@@ -572,6 +615,8 @@ def main():
     gh_token = get_github_token()
     db_path = get_db_path()
     repos = cfg["github"]["repos"]
+    if args.repos:
+        repos = [r.strip() for r in args.repos.split(",") if r.strip()]
 
     # Set up DB
     db_conn = None
@@ -579,6 +624,7 @@ def main():
         db_conn = get_db_connection(db_path)
         ensure_tables(db_conn)
         seed_dimensions(db_conn)
+        reattribute_prs(db_conn)
 
     # Determine date range
     if args.since:
@@ -637,7 +683,7 @@ def main():
 
         for i, pr in enumerate(candidates):
             number = pr["number"]
-            author = pr["user"]["login"]
+            author = (pr.get("user") or {}).get("login", "")
 
             if args.verbose:
                 log(f"  [{i+1}/{len(candidates)}] PR #{number} by {author}")
@@ -690,10 +736,14 @@ def main():
     if db_conn and not args.dry_run:
         from lib.db import update_watermark
         with_db_retry(db_conn.commit)
+    # A repo-subset run leaves the other repos unsynced, so the shared
+    # watermark must not move forward.
+    if db_conn and not args.dry_run and not args.repos:
         with_db_retry(lambda: update_watermark(
             db_conn, "etl_watermark", "github_pr_etl",
             now_iso, total_processed, "prs_processed",
         ))
+    if db_conn:
         db_conn.close()
 
     log(f"\nDone. Processed {total_processed} PRs, skipped {total_skipped}.")

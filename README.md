@@ -23,6 +23,7 @@ cp config.example.toml config.toml
 python3 github_etl.py                          # PR data
 python3 jira_etl.py                            # Jira issue data
 python3 jira_etl.py --backfill                 # Link Jira issues to PRs
+python3 github_issues_etl.py                   # GitHub Issues tasks (optional)
 python3 webex_etl.py --since 2026-01-01        # Webex room messages (optional)
 python3 victorops_etl.py --since 2026-01-01    # VictorOps incidents (optional)
 python3 firehydrant_etl.py --since 2026-01-01  # FireHydrant incidents (optional)
@@ -167,6 +168,19 @@ members = ["dave", "eve"]
 repos = ["my-org/api-server", "my-org/web-app"]
 ```
 
+### GitHub Issues as Task Tracker (optional)
+
+If your team tracks tasks as GitHub Issues instead of (or after) Jira, configure the repos to scan. Issues are attributed to a team by assignee — the first assignee who is a team member. The in-progress timestamp comes from Projects v2 status-change events on the issue timeline; since each project board has its own status names, list every name that means "started".
+
+```toml
+[github.issues]
+repos = ["my-org/api-server"]
+in_progress_statuses = ["In Progress", "In Development", "In Review"]
+exclude_types = ["Epic"]     # container issue types to leave out
+```
+
+The GitHub token needs **Issues** → Read-only on these repos. Org Projects access is not required.
+
 ### Jira Projects & Custom Fields
 
 ```toml
@@ -238,6 +252,11 @@ python3 jira_etl.py --backfill                 # Fetch Jira issues linked to PRs
 python3 jira_etl.py --backfill-changelog       # Fetch status change history
 python3 jira_etl.py --dry-run --verbose        # Preview without writing
 
+# GitHub Issues ETL (full re-sync of team-assigned issues each run)
+python3 github_issues_etl.py                   # Full sync
+python3 github_issues_etl.py --since 2026-09-01  # Only issues updated since
+python3 github_issues_etl.py --dry-run         # Preview without writing
+
 # Webex ETL
 python3 webex_etl.py                           # Incremental
 python3 webex_etl.py --since 2026-01-01        # Backfill from date
@@ -261,6 +280,7 @@ python3 github_etl.py --since 2026-01-01       # 1. Load PR history
 python3 jira_etl.py --since 2026-01-01         # 2. Load Jira issue history
 python3 jira_etl.py --backfill                 # 3. Fill in Jira issues linked from PRs
 python3 jira_etl.py --backfill-changelog       # 4. Get status transitions for cycle time
+python3 github_issues_etl.py                   # 4b. Optional: GitHub Issues tasks
 python3 webex_etl.py --since 2026-01-01        # 5. Optional: Webex messages
 python3 victorops_etl.py --since 2026-01-01    # 6. Optional: VictorOps incidents
 python3 firehydrant_etl.py --since 2026-01-01  # 7. Optional: FireHydrant incidents
@@ -268,7 +288,7 @@ python3 firehydrant_etl.py --since 2026-01-01  # 7. Optional: FireHydrant incide
 
 ## Scheduling with Cron
 
-Cron wrappers are included in `scripts/` for all five ETLs. They handle logging and log rotation.
+Cron wrappers are included in `scripts/` for all six ETLs. They handle logging and log rotation.
 
 ```bash
 crontab -e
@@ -282,6 +302,7 @@ Example schedule (adjust paths as needed):
 10 8 * * * /path/to/developer-cycle-time-dashboard/scripts/run_webex_etl.sh
 15 8 * * * /path/to/developer-cycle-time-dashboard/scripts/run_victorops_etl.sh
 20 8 * * * /path/to/developer-cycle-time-dashboard/scripts/run_firehydrant_etl.sh
+25 8 * * * /path/to/developer-cycle-time-dashboard/scripts/run_github_issues_etl.sh
 ```
 
 All ETLs can run concurrently — they use SQLite WAL mode with a 60-second busy timeout and exponential backoff retry on lock contention. Webex, VictorOps, and FireHydrant write to tables that don't overlap with GitHub or Jira, so the 5-minute stagger above is just belt-and-suspenders.
@@ -292,17 +313,19 @@ Logs are written to `data/logs/` and can be viewed in the dashboard's **ETL Logs
 
 - **PR Lifecycle** — PRs created, AI co-authoring breakdown (Claude, Copilot, ChatGPT, Gemini, Cursor via Co-authored-by trailers), PR size (files + lines, avg + P90)
 - **Reviews** — reviews submitted, review burden by origin (internal vs external PRs), top external authors your teams review
-- **Task Cycle Time** — three-phase breakdown: In Progress → first PR → merged → Done (requires Jira data)
+- **Task Cycle Time** — GitHub Issues tasks: completed per week, Created → Closed and In Progress → Closed durations, linked-PR coverage (requires `[github.issues]`). Jira three-phase breakdown (In Progress → first PR → merged → Done) kept for historical data
+- **Throughput vs Load / Reviews for Other Teams** — throughput = merged PRs + Jira Done + GitHub tasks closed, compared against support load and against your team's reviews on PRs authored outside the team
 - **Support Load** — support tickets (if `[jira.support]` configured), Webex asks in your configured room, FireHydrant S1–S4 incident volume
 - **On-Call** — VictorOps incident counts, MTTA/MTTR, services most frequently paging, per-team breakdown
 - **Incident Response** — FireHydrant incidents with time-to-detect / ack / mitigate / resolve, incident commander assignments
 - **Individual Breakdown** — per-person stats (toggle in sidebar)
-- **ETL Logs** — view run history and errors for all five pipelines
+- **ETL Logs** — view run history and errors for all six pipelines
 
 ## Architecture
 
 ```
 GitHub REST API   ──→ github_etl.py     ──→ ┐
+GitHub GraphQL    ──→ github_issues_etl.py ─→ │
 Jira REST API     ──→ jira_etl.py       ──→ │
 Webex REST API    ──→ webex_etl.py      ──→ ├──→ SQLite DB ──→ dashboard.py (Streamlit)
 VictorOps REST    ──→ victorops_etl.py  ──→ │
@@ -313,6 +336,7 @@ The ETLs are pure Python stdlib (no pip dependencies) so they run anywhere Pytho
 
 Data flows through a shared SQLite database:
 - `fact_pr`, `dim_review`, `dim_author`, `dim_repo`, `bridge_pr_jira` — GitHub
+- `dim_gh_issue`, `dim_gh_issue_status_change`, `bridge_pr_gh_issue` — GitHub Issues
 - `dim_jira_issue`, `dim_jira_status_change` — Jira
 - `fact_webex_message` — Webex
 - `fact_vo_incident` — VictorOps

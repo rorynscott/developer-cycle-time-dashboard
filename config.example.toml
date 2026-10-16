@@ -164,6 +164,16 @@ repos = [
 # Auth: set GITHUB_TOKEN env var, or provide a file path here
 # token_path = "~/.github_pat"
 
+# Optional: track tasks as GitHub Issues (alternative/successor to Jira).
+# Issues are scoped to your teams by assignee. Requires github_issues_etl.py.
+# [github.issues]
+# repos = ["my-org/my-repo"]
+# # Projects v2 Status values (case-insensitive) that mark work as started;
+# # the earliest matching status change becomes the in-progress timestamp.
+# in_progress_statuses = ["In Progress", "In Development", "In Review"]
+# # Container issue types to leave out of task cycle time and throughput
+# exclude_types = ["Epic"]
+
 # ── Jira ───────────────────────────────────────────────────────────────────
 
 [jira]
@@ -267,6 +277,13 @@ members = [
     "github-user-1",
     "github-user-2",
 ]
+# Optional: people who left. Work they finished (PR merged/closed, issue
+# closed, review submitted) before left_on stays attributed to the team.
+# ETLs re-attribute stored history on every run, so roster edits apply
+# retroactively without a backfill.
+# former_members = [
+#     { login = "github-user-0", left_on = "2026-10-01" },
+# ]
 
 [[teams]]
 name = "Other Team"

@@ -91,6 +91,12 @@ def _validate(cfg):
                 errors.append(f"[[teams]] entry {i}: name is required")
             if "members" not in team or not team["members"]:
                 errors.append(f"[[teams]] entry {i} ({team.get('name', '?')}): members is required")
+            for fm in team.get("former_members", []):
+                if not fm.get("login") or not fm.get("left_on"):
+                    errors.append(
+                        f"[[teams]] entry {i} ({team.get('name', '?')}): "
+                        "former_members entries need login and left_on"
+                    )
 
     if errors:
         print("Config validation errors:", file=sys.stderr)
@@ -105,7 +111,9 @@ def _validate(cfg):
 def get_teams():
     """Return list of team dicts with defaults filled in.
 
-    Each dict has: name, short_name, color, members.
+    Each dict has: name, short_name, color, members, former_members.
+    former_members is a list of {login, left_on} where left_on is an ISO
+    date (YYYY-MM-DD); work finished before that date stays on the team.
     """
     cfg = load_config()
     teams = []
@@ -115,25 +123,59 @@ def get_teams():
             "short_name": t.get("short_name") or t["name"].split()[0],
             "color": t.get("color") or _DEFAULT_PALETTE[i % len(_DEFAULT_PALETTE)],
             "members": list(t["members"]),
+            "former_members": [
+                {"login": fm["login"], "left_on": str(fm["left_on"])}
+                for fm in t.get("former_members", [])
+            ],
         })
     return teams
 
 
 def get_team_members():
-    """Return flat set of all GitHub usernames across all teams."""
-    members = set()
-    for t in get_teams():
-        members.update(t["members"])
-    return members
+    """Return flat set of all GitHub usernames across all teams.
+
+    Includes former members so ETLs keep their pre-departure history
+    current; use get_team_resolver() to decide attribution.
+    """
+    return set(get_team_lookup())
 
 
 def get_team_lookup():
-    """Return {github_username: team_name} mapping."""
+    """Return {github_username: team_name}, including former members."""
     lookup = {}
     for t in get_teams():
         for m in t["members"]:
             lookup[m] = t["name"]
+        for fm in t["former_members"]:
+            lookup[fm["login"]] = t["name"]
     return lookup
+
+
+def get_former_members():
+    """Return {github_username: left_on 'YYYY-MM-DD'} for members who left."""
+    return {
+        fm["login"]: fm["left_on"]
+        for t in get_teams() for fm in t["former_members"]
+    }
+
+
+def get_team_resolver():
+    """Return team_at(login, when) -> team name or None.
+
+    ``when`` is when the work finished (ISO string or datetime; None means
+    still open, i.e. now). Former members only count before their left_on.
+    """
+    lookup = get_team_lookup()
+    left_on = get_former_members()
+
+    def team_at(login, when=None):
+        team = lookup.get(login)
+        cutoff = left_on.get(login)
+        if team and cutoff and (when is None or str(when)[:10] >= cutoff):
+            return None
+        return team
+
+    return team_at
 
 
 def get_team_colors():
@@ -175,6 +217,23 @@ def get_github_token():
         file=sys.stderr,
     )
     sys.exit(1)
+
+
+def get_github_issues_config():
+    """Return GitHub Issues task-tracking config, or None if not configured.
+
+    Shape: {repos: [...], in_progress_statuses: [...], exclude_types: [...]}
+    """
+    issues = load_config().get("github", {}).get("issues")
+    if not issues or not issues.get("repos"):
+        return None
+    return {
+        "repos": list(issues["repos"]),
+        "in_progress_statuses": list(issues.get(
+            "in_progress_statuses", ["In Progress", "In Development"],
+        )),
+        "exclude_types": list(issues.get("exclude_types", [])),
+    }
 
 
 def get_jira_token():

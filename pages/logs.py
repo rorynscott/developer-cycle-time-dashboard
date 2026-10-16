@@ -22,6 +22,11 @@ ETL_CONFIGS = [
         "error_file": os.path.join(LOG_DIR, "pr_etl_errors.log"),
     },
     {
+        "name": "GitHub Issues ETL",
+        "log_file": os.path.join(LOG_DIR, "github_issues_etl.log"),
+        "error_file": os.path.join(LOG_DIR, "github_issues_etl_errors.log"),
+    },
+    {
         "name": "Jira ETL",
         "log_file": os.path.join(LOG_DIR, "jira_etl.log"),
         "error_file": os.path.join(LOG_DIR, "jira_etl_errors.log"),

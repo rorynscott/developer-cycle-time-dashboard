@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lib.config import (
     load_config, get_teams, get_team_names, get_team_colors,
     get_db_path, get_dashboard_title, get_dashboard_default_days,
-    get_jira_support_config,
+    get_jira_support_config, get_github_issues_config,
 )
 from lib.categorize import categorize
 
@@ -177,6 +177,68 @@ def load_task_cycle_times():
 
 
 @st.cache_data(ttl=300)
+def load_gh_task_cycle_times():
+    """Load completed GitHub-issue tasks (team-assigned) with linked PR timing.
+
+    Unlike the Jira loader this keeps issues without a linked PR or an
+    in-progress status event — most GitHub tasks have neither — and leaves
+    the per-phase columns NaN where the signal is missing.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT
+                i.issue_key, i.title, i.url, i.issue_type, i.repo_key,
+                i.team_name, i.primary_assignee,
+                i.created_at, i.first_in_progress_at, i.closed_at,
+                COUNT(DISTINCT p.pr_key) AS pr_count,
+                MIN(p.created_at) AS first_pr_created,
+                MAX(p.merged_at) AS last_pr_merged
+            FROM dim_gh_issue i
+            LEFT JOIN bridge_pr_gh_issue b ON b.issue_key = i.issue_key
+            LEFT JOIN fact_pr p ON p.pr_key = b.pr_key
+                AND p.state = 'merged' AND p.team_name IS NOT NULL
+            WHERE i.state_reason = 'COMPLETED'
+                AND i.team_name IS NOT NULL
+                AND i.closed_at IS NOT NULL
+            GROUP BY i.issue_key
+            """,
+            conn,
+        )
+    except (pd.io.sql.DatabaseError, sqlite3.OperationalError):
+        conn.close()
+        return pd.DataFrame()
+    conn.close()
+
+    if df.empty:
+        return df
+
+    issues_cfg = get_github_issues_config()
+    excluded = set(issues_cfg["exclude_types"]) if issues_cfg else set()
+    df = df[~df["issue_type"].isin(excluded)].copy()
+
+    for col in ("created_at", "first_in_progress_at", "closed_at",
+                "first_pr_created", "last_pr_merged"):
+        df[col] = pd.to_datetime(df[col], utc=True)
+
+    day = 86400
+    df["created_to_close_days"] = (
+        (df["closed_at"] - df["created_at"]).dt.total_seconds() / day
+    )
+    df["ip_to_close_days"] = (
+        (df["closed_at"] - df["first_in_progress_at"]).dt.total_seconds() / day
+    )
+    df["pr_cycle_days"] = (
+        (df["last_pr_merged"] - df["first_pr_created"]).dt.total_seconds() / day
+    )
+    # Status set after closing (board cleanup) isn't a real start time
+    df.loc[df["ip_to_close_days"] < 0, "ip_to_close_days"] = np.nan
+    df["closed_date"] = df["closed_at"].dt.date
+    return df
+
+
+@st.cache_data(ttl=300)
 def load_throughput_load_daily():
     """Daily series of engineering throughput and support load, team-scoped.
 
@@ -186,6 +248,9 @@ def load_throughput_load_daily():
                     at least one linked PR authored by one of our teams.
                     (We don't have a Jira-assignee → team mapping, so using
                     the linked-PR relationship scopes ownership cleanly.)
+      - gh_done:    GitHub issues closed as completed, assigned to our teams
+                    (the team's task tracker after moving off Jira).
+                    Container types (github.issues.exclude_types) excluded.
 
     Support load components:
       - ztce_created: ZTCE tickets created, scoped to configured support teams
@@ -204,10 +269,8 @@ def load_throughput_load_daily():
     team_list = [t["name"] for t in teams]
     placeholders = ",".join("?" for _ in team_list)
 
-    # Primary team for the review-burden hypothesis. We look at review
-    # burden "from the Directory side": Directory reviews far more DDAS PRs
-    # (1,263) than DDAS reviews Directory PRs (48), so scoping to the first
-    # configured team captures nearly all the cross-team review flow.
+    # Primary team for the review-burden hypothesis: the first configured
+    # team. Review burden is its reviews on PRs from outside that team.
     primary_team = team_list[0] if team_list else None
 
     # 1. Merged PRs per day
@@ -244,6 +307,37 @@ def load_throughput_load_daily():
         )
     except (pd.io.sql.DatabaseError, sqlite3.OperationalError):
         jira_done = pd.DataFrame(columns=["d", "jira_done"])
+
+    # 2b. Completed GitHub-issue tasks, per team (assignee-scoped)
+    issues_cfg = get_github_issues_config()
+    excluded_types = issues_cfg["exclude_types"] if issues_cfg else []
+    type_filter = (
+        f"AND COALESCE(issue_type, '') NOT IN "
+        f"({','.join('?' for _ in excluded_types)})"
+        if excluded_types else ""
+    )
+    gh_done_by_team = pd.DataFrame(columns=["d", "team_name", "n"])
+    try:
+        gh_done_by_team = pd.read_sql_query(
+            f"""
+            SELECT DATE(closed_at) AS d, team_name, COUNT(*) AS n
+            FROM dim_gh_issue
+            WHERE state_reason = 'COMPLETED' AND closed_at IS NOT NULL
+              AND team_name IN ({placeholders})
+              {type_filter}
+            GROUP BY DATE(closed_at), team_name
+            """,
+            conn, params=team_list + excluded_types,
+        )
+    except (pd.io.sql.DatabaseError, sqlite3.OperationalError):
+        pass
+    gh_done = (
+        gh_done_by_team.groupby("d")["n"].sum().reset_index(name="gh_done")
+    )
+    primary_gh = (
+        gh_done_by_team[gh_done_by_team["team_name"] == primary_team]
+        .groupby("d")["n"].sum().reset_index(name="primary_gh_done")
+    )
 
     # 3. ZTCE tickets created (scoped via support_team custom field)
     support_cfg = get_jira_support_config()
@@ -291,8 +385,8 @@ def load_throughput_load_daily():
 
     # 4b. Review burden: primary team's reviews on PRs NOT authored by the
     #     primary team (self-team reviews excluded so we don't correlate the
-    #     team's own PRs against itself). This counts DDAS + external PRs the
-    #     Directory team reviews — the "pure cost" review work.
+    #     team's own PRs against itself). This counts other-team and external
+    #     PRs the team reviews — the "pure cost" review work.
     reviews_done = pd.DataFrame(columns=["d", "reviews_done"])
     if primary_team:
         try:
@@ -302,10 +396,10 @@ def load_throughput_load_daily():
                 FROM dim_review r
                 JOIN dim_author ra ON r.reviewer_login = ra.author_login
                 JOIN fact_pr p ON r.pr_key = p.pr_key
-                LEFT JOIN dim_author pa ON p.author_login = pa.author_login
                 WHERE ra.team_name = ?
                   AND r.submitted_at IS NOT NULL
-                  AND (pa.team_name IS NULL OR pa.team_name != ?)
+                  AND (ra.left_on IS NULL OR r.submitted_at < ra.left_on)
+                  AND (p.team_name IS NULL OR p.team_name != ?)
                 GROUP BY DATE(r.submitted_at)
                 """,
                 conn, params=(primary_team, primary_team),
@@ -374,8 +468,8 @@ def load_throughput_load_daily():
 
     # Outer-join everything on date
     import functools
-    frames = [prs, jira_done, ztce, webex_asks, fh_real, reviews_done,
-              primary_merged, primary_jira]
+    frames = [prs, jira_done, gh_done, ztce, webex_asks, fh_real,
+              reviews_done, primary_merged, primary_jira, primary_gh]
     frames = [f for f in frames if not f.empty]
     if not frames:
         return pd.DataFrame()
@@ -387,21 +481,24 @@ def load_throughput_load_daily():
     out["d"] = pd.to_datetime(out["d"]).dt.date
     out = out.sort_values("d").reset_index(drop=True)
     # Integer columns
-    for col in ("merged_prs", "jira_done", "ztce_created", "webex_asks",
-                "fh_real", "reviews_done", "primary_merged_prs",
-                "primary_jira_done"):
+    for col in ("merged_prs", "jira_done", "gh_done", "ztce_created",
+                "webex_asks", "fh_real", "reviews_done", "primary_merged_prs",
+                "primary_jira_done", "primary_gh_done"):
         if col in out.columns:
             out[col] = out[col].astype(int)
         else:
             out[col] = 0
 
     # Composites
-    out["throughput"] = out["merged_prs"] + out["jira_done"]
+    out["throughput"] = out["merged_prs"] + out["jira_done"] + out["gh_done"]
     out["support_load"] = out["ztce_created"] + out["webex_asks"] + out["fh_real"]
     out["review_burden"] = out["reviews_done"]
     # Primary-team-only throughput, paired with review_burden in the
     # hypothesis correlation below.
-    out["primary_throughput"] = out["primary_merged_prs"] + out["primary_jira_done"]
+    out["primary_throughput"] = (
+        out["primary_merged_prs"] + out["primary_jira_done"]
+        + out["primary_gh_done"]
+    )
     return out
 
 
@@ -703,11 +800,14 @@ def load_reviews():
             """
             SELECT
                 r.review_key, r.pr_key, r.reviewer_login, r.review_state,
-                r.submitted_at, a.team_name AS reviewer_team,
+                r.submitted_at,
+                -- Former members stop counting for the team after left_on
+                CASE WHEN a.left_on IS NULL OR r.submitted_at < a.left_on
+                     THEN a.team_name END AS reviewer_team,
                 p.files_changed, p.lines_added, p.lines_removed,
                 p.total_lines_changed,
                 p.author_login AS pr_author,
-                pa.team_name AS pr_author_team,
+                p.team_name AS pr_author_team,
                 pa.is_tracked AS pr_author_is_tracked
             FROM dim_review r
             LEFT JOIN dim_author a ON r.reviewer_login = a.author_login
@@ -843,6 +943,7 @@ def main():
     etl_sources = [
         ("GitHub", "etl_watermark", "github_pr_etl"),
         ("Jira", "etl_watermark_jira", "jira_etl"),
+        ("GitHub Issues", "etl_watermark_gh_issues", "github_issues_etl"),
         ("Webex", "etl_watermark_webex", "webex_etl"),
         ("VictorOps", "etl_watermark_victorops", "victorops_etl"),
         ("FireHydrant", "etl_watermark_firehydrant", "firehydrant_etl"),
@@ -868,6 +969,7 @@ def main():
     prs = load_prs()
     reviews = load_reviews()
     task_cycles = load_task_cycle_times()
+    gh_tasks = load_gh_task_cycle_times()
     support = load_support_tickets()
     webex = load_webex_messages()
     vo = load_vo_incidents()
@@ -922,7 +1024,7 @@ def main():
      tab_trb) = st.tabs(
         ["Overview", "Reviews", "PR Size", "Cycle Time",
          "Support", "On-Call", "Incidents", "Throughput vs Load",
-         "Throughput vs Review Burden"]
+         "Throughput vs Reviews for Other Teams"]
     )
 
     # ── Overview tab ───────────────────────────────────────────────────────
@@ -1166,11 +1268,119 @@ def main():
 
     with tab_cycle_time:
 
-        st.header("Task Cycle Time — In Progress → Done")
+        st.header("Task Cycle Time (GitHub Issues)")
+        issues_cfg = get_github_issues_config()
+        issue_repos = ", ".join(
+            r.split("/")[-1] for r in (issues_cfg["repos"] if issues_cfg else [])
+        )
+        st.caption(
+            f"Completed GitHub issues in {issue_repos or '—'} assigned to a team "
+            "member (attributed to the first team-member assignee). "
+            "**In Progress → Closed** uses the earliest Projects status change "
+            "matching `github.issues.in_progress_statuses`; issues that never "
+            "got such a status are excluded from that metric only. "
+            "**Linked PR** = a merged team PR that closes or references the "
+            "issue. Container types (`github.issues.exclude_types`) are omitted."
+        )
+
+        gt = pd.DataFrame()
+        if not gh_tasks.empty:
+            gt = gh_tasks[
+                gh_tasks["team_name"].isin(selected_teams)
+                & (gh_tasks["closed_date"] >= start_date)
+                & (gh_tasks["closed_date"] <= end_date)
+            ]
+
+        if gh_tasks.empty:
+            st.info(
+                "No GitHub issue data. Configure `[github.issues]` and run:"
+                "\n```\npython3 github_issues_etl.py\n```"
+            )
+        elif gt.empty:
+            st.info("No completed GitHub tasks in this date range.")
+        else:
+            ip = gt["ip_to_close_days"].dropna()
+            linked = gt[gt["pr_count"] > 0]
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Completed Tasks", len(gt))
+            k2.metric("Median Created → Closed (days)",
+                      f"{gt['created_to_close_days'].median():.1f}")
+            k3.metric("Median In Progress → Closed (days)",
+                      f"{ip.median():.1f}" if len(ip) else "—",
+                      delta=f"n={len(ip)} of {len(gt)}", delta_color="off")
+            k4.metric("With Linked Merged PR", len(linked),
+                      delta=f"{len(linked) / len(gt) * 100:.0f}% of tasks",
+                      delta_color="off")
+            if len(ip) < 20:
+                st.warning(
+                    f"Only {len(ip)} tasks have an in-progress timestamp in "
+                    "this range — treat the In Progress → Closed median as "
+                    "anecdotal, not a trend."
+                )
+
+            col_a, col_b = st.columns(2)
+            with col_a:
+                weekly_gt = gt.copy()
+                weekly_gt["week"] = (
+                    pd.to_datetime(weekly_gt["closed_date"])
+                    .dt.to_period("W-MON").dt.start_time
+                )
+                wk = weekly_gt.groupby(["week", "team_name"]).size().reset_index(name="tasks")
+                fig = px.bar(
+                    wk, x="week", y="tasks", color="team_name",
+                    color_discrete_map=COLORS,
+                    title="Tasks Completed per Week",
+                    labels={"week": "Week", "tasks": "Tasks", "team_name": "Team"},
+                )
+                fig.update_layout(xaxis_tickformat="%b %d",
+                                  legend=dict(orientation="h", y=-0.2))
+                st.plotly_chart(fig, use_container_width=True)
+            with col_b:
+                melted = gt.melt(
+                    id_vars=["issue_key", "team_name"],
+                    value_vars=["created_to_close_days", "ip_to_close_days"],
+                    var_name="metric", value_name="days",
+                ).dropna(subset=["days"])
+                melted["metric"] = melted["metric"].map({
+                    "created_to_close_days": "Created → Closed",
+                    "ip_to_close_days": "In Progress → Closed",
+                })
+                fig2 = px.box(
+                    melted, x="metric", y="days", color="team_name",
+                    color_discrete_map=COLORS, points="all",
+                    title="Task Duration Distribution",
+                    labels={"metric": "", "days": "Days", "team_name": "Team"},
+                )
+                fig2.update_layout(legend=dict(orientation="h", y=-0.2))
+                st.plotly_chart(fig2, use_container_width=True)
+
+            with st.expander("Raw data"):
+                show = gt[[
+                    "issue_key", "title", "issue_type", "team_name",
+                    "primary_assignee", "created_to_close_days",
+                    "ip_to_close_days", "pr_count", "pr_cycle_days", "url",
+                ]].copy()
+                for c in ("created_to_close_days", "ip_to_close_days", "pr_cycle_days"):
+                    show[c] = show[c].round(1)
+                show.columns = [
+                    "Issue", "Title", "Type", "Team", "Assignee",
+                    "Created→Closed Days", "In Progress→Closed Days",
+                    "Linked PRs", "PR Cycle Days", "URL",
+                ]
+                st.dataframe(
+                    show.sort_values("Created→Closed Days", ascending=False),
+                    hide_index=True, use_container_width=True,
+                    column_config={"URL": st.column_config.LinkColumn("URL")},
+                )
+
+        st.divider()
+        st.subheader("Task Cycle Time (Jira, historical) — In Progress → Done")
         st.caption(
             "For Jira issues linked to merged PRs: three-phase breakdown from "
             "In Progress → first PR opened → last PR merged → Done. "
-            "Uses Jira changelog timestamps for accurate lifecycle tracking."
+            "Uses Jira changelog timestamps for accurate lifecycle tracking. "
+            "The team has moved task tracking to GitHub Issues, so this only "
+            "covers work tracked in Jira before the switch."
         )
 
         if not task_cycles.empty:
@@ -2384,7 +2594,8 @@ def main():
         st.caption(
             "Does our team's output drive the support load we see? "
             "Throughput = merged PRs + Jira issues transitioned to Done "
-            "(scoped to issues with a linked PR from our teams). "
+            "(scoped to issues with a linked PR from our teams) + GitHub "
+            "issues closed as completed (team-assigned). "
             "Support load = ZTCE tickets + Webex asks + FireHydrant "
             "S1–S4 incidents scoped via the Incidents-tab rules "
             "(team-member role OR keyword match). A lag peak in the "
@@ -2412,6 +2623,7 @@ def main():
                 weekly = tvl_weekly.groupby("week").agg({
                     "merged_prs": "sum",
                     "jira_done": "sum",
+                    "gh_done": "sum",
                     "ztce_created": "sum",
                     "webex_asks": "sum",
                     "fh_real": "sum",
@@ -2436,7 +2648,7 @@ def main():
                 fig_idx = go.Figure()
                 fig_idx.add_trace(go.Scatter(
                     x=weekly["week"], y=weekly["throughput_idx"],
-                    mode="lines+markers", name="Throughput (PRs + Jira done)",
+                    mode="lines+markers", name="Throughput (PRs + Jira + GH tasks)",
                     line=dict(color="#636EFA", width=2),
                 ))
                 fig_idx.add_trace(go.Scatter(
@@ -2456,14 +2668,14 @@ def main():
                 st.subheader("Weekly Totals (raw)")
                 st.caption("Absolute counts behind the indexed view above.")
                 disp = weekly[[
-                    "week", "merged_prs", "jira_done",
+                    "week", "merged_prs", "jira_done", "gh_done",
                     "throughput", "ztce_created", "webex_asks", "fh_real",
                     "support_load",
                 ]].copy()
                 disp["week"] = pd.to_datetime(disp["week"]).dt.strftime("%Y-%m-%d")
                 disp.columns = [
-                    "Week", "Merged PRs", "Jira Done", "Throughput",
-                    "ZTCE", "Webex Asks", "FH S1-S4", "Support Load",
+                    "Week", "Merged PRs", "Jira Done", "GH Tasks Done",
+                    "Throughput", "ZTCE", "Webex Asks", "FH S1-S4", "Support Load",
                 ]
                 st.dataframe(disp, hide_index=True, use_container_width=True)
 
@@ -2485,6 +2697,9 @@ def main():
                     if len(paired) < 4:
                         continue
                     r = paired["throughput"].corr(paired.iloc[:, 1])
+                    # Constant series (e.g. a stretch with no data) → NaN r
+                    if pd.isna(r):
+                        continue
                     corrs.append({"lag_weeks": lag, "correlation": r, "n": len(paired)})
                 corrs_df = pd.DataFrame(corrs)
 
@@ -2564,26 +2779,29 @@ def main():
                     fig_ratio.update_layout(xaxis_tickformat="%b %d")
                     st.plotly_chart(fig_ratio, use_container_width=True)
 
-    # ── Throughput vs Review Burden tab ─────────────────────────────────────
-    #     Entirely scoped to the primary team (Directory) so we never mix
-    #     data lenses: Directory's own throughput vs Directory's reviews on
-    #     OTHER teams' PRs. Tests the hypothesis that heavy cross-team review
-    #     weeks crowd out Directory's own delivery.
+    # ── Throughput vs Reviews for Other Teams tab ───────────────────────────
+    #     Entirely scoped to the primary (first configured) team so we never
+    #     mix data lenses: its own throughput vs its reviews on PRs from
+    #     outside the team. Tests the hypothesis that heavy outside-review
+    #     weeks crowd out the team's own delivery.
 
     with tab_trb:
         _teams = get_teams()
         _primary_team = _teams[0] if _teams else {"name": "the team"}
         primary_label = _primary_team.get("short_name") or _primary_team["name"]
 
-        st.header(f"Throughput vs Review Burden — {primary_label}")
+        st.header(f"Throughput vs Reviews for Other Teams — {primary_label}")
         st.caption(
             f"Everything on this tab is scoped to **{primary_label} only**. "
             f"Throughput = {primary_label}'s merged PRs + Jira issues "
             "transitioned to Done (linked to a "
-            f"{primary_label} PR). Review burden = {primary_label} reviews on "
-            "PRs authored by OTHER teams (self-team reviews excluded, so the "
-            "two series share no PRs). Hypothesis: heavy cross-team review "
-            f"weeks crowd out {primary_label}'s own delivery."
+            f"{primary_label} PR) + GitHub issues closed as completed "
+            f"(assigned to {primary_label}). Reviews for other teams = "
+            f"{primary_label} reviews on PRs authored by anyone outside "
+            f"{primary_label}, including former members after they left "
+            "(self-team reviews excluded, so the two series share no PRs). "
+            "Hypothesis: weeks heavy on reviewing other teams' PRs crowd out "
+            f"{primary_label}'s own delivery."
         )
 
         trb = load_throughput_load_daily()
@@ -2605,6 +2823,7 @@ def main():
                 rweekly = trb_weekly.groupby("week").agg({
                     "primary_merged_prs": "sum",
                     "primary_jira_done": "sum",
+                    "primary_gh_done": "sum",
                     "reviews_done": "sum",
                     "primary_throughput": "sum",
                     "review_burden": "sum",
@@ -2629,13 +2848,13 @@ def main():
                 fig_idx.add_trace(go.Scatter(
                     x=rweekly["week"], y=rweekly["throughput_idx"],
                     mode="lines+markers",
-                    name=f"{primary_label} throughput (PRs + Jira done)",
+                    name=f"{primary_label} throughput (PRs + Jira + GH tasks)",
                     line=dict(color="#636EFA", width=2),
                 ))
                 fig_idx.add_trace(go.Scatter(
                     x=rweekly["week"], y=rweekly["review_idx"],
                     mode="lines+markers",
-                    name=f"Review burden ({primary_label} → other teams)",
+                    name=f"Reviews for other teams ({primary_label} → others)",
                     line=dict(color="#00CC96", width=2),
                 ))
                 fig_idx.add_hline(y=100, line_dash="dot", line_color="#888",
@@ -2652,24 +2871,24 @@ def main():
                 st.caption("Absolute counts behind the indexed view above.")
                 rdisp = rweekly[[
                     "week", "primary_merged_prs", "primary_jira_done",
-                    "primary_throughput", "review_burden",
+                    "primary_gh_done", "primary_throughput", "review_burden",
                 ]].copy()
                 rdisp["week"] = pd.to_datetime(rdisp["week"]).dt.strftime("%Y-%m-%d")
                 rdisp.columns = [
-                    "Week", "Merged PRs", "Jira Done", "Throughput",
-                    "Review Burden",
+                    "Week", "Merged PRs", "Jira Done", "GH Tasks Done",
+                    "Throughput", "Reviews for Other Teams",
                 ]
                 st.dataframe(rdisp, hide_index=True, use_container_width=True)
 
                 # ── Concurrent correlation (the hypothesis test) ──────────
-                st.subheader("Review Burden vs Throughput (same week)")
+                st.subheader("Reviews for Other Teams vs Throughput (same week)")
                 st.caption(
                     "Review work here is largely just-in-time, so we compare "
-                    "review burden and throughput in the **same week** (no "
-                    "lag). Pearson r measures direction and strength; r² is "
-                    "the share of week-to-week throughput variation that "
-                    "tracks with review burden. A negative r supports 'more "
-                    "reviews → less throughput'."
+                    "reviews for other teams and throughput in the **same "
+                    "week** (no lag). Pearson r measures direction and "
+                    "strength; r² is the share of week-to-week throughput "
+                    "variation that tracks with those reviews. A negative r "
+                    "supports 'more reviews for others → less throughput'."
                 )
                 paired = rweekly[["review_burden", "primary_throughput"]].dropna()
                 n_weeks = len(paired)
@@ -2696,19 +2915,20 @@ def main():
                     elif r > -0.3:
                         st.warning(
                             "No meaningful negative correlation (r > -0.3). "
-                            "The data does not support the 'more reviews → "
-                            "less throughput' hypothesis in this range."
+                            "The data does not support the 'more reviews for "
+                            "others → less throughput' hypothesis in this range."
                         )
                     elif r > -0.5:
                         st.info(
                             "Modest negative correlation. Suggestive that "
-                            "review burden trades against throughput, but "
+                            "reviewing for others trades against throughput, but "
                             "inconclusive — gather more history."
                         )
                     else:
                         st.success(
                             f"Meaningful negative correlation (r={r:+.2f}, "
-                            f"r²={r2:.2f}) — busy review weeks coincide with "
+                            f"r²={r2:.2f}) — heavy weeks of reviewing for "
+                            f"other teams coincide with "
                             f"lower throughput."
                         )
 
@@ -2716,20 +2936,22 @@ def main():
                     fig_sc = px.scatter(
                         paired, x="review_burden", y="primary_throughput",
                         labels={
-                            "review_burden": "Weekly review burden",
+                            "review_burden": "Weekly reviews for other teams",
                             "primary_throughput": f"{primary_label} weekly throughput",
                         },
                     )
                     # Least-squares fit line (np.polyfit; statsmodels not a dep)
                     xv = paired["review_burden"].values.astype(float)
                     yv = paired["primary_throughput"].values.astype(float)
-                    coeffs = np.polyfit(xv, yv, 1)
-                    xline = np.array([xv.min(), xv.max()])
-                    fig_sc.add_trace(go.Scatter(
-                        x=xline, y=np.polyval(coeffs, xline),
-                        mode="lines", name="Fit",
-                        line=dict(color="#888", width=2, dash="dash"),
-                    ))
+                    # Skip the fit when x is constant — the system is singular
+                    if np.ptp(xv) > 0:
+                        coeffs = np.polyfit(xv, yv, 1)
+                        xline = np.array([xv.min(), xv.max()])
+                        fig_sc.add_trace(go.Scatter(
+                            x=xline, y=np.polyval(coeffs, xline),
+                            mode="lines", name="Fit",
+                            line=dict(color="#888", width=2, dash="dash"),
+                        ))
                     st.plotly_chart(fig_sc, use_container_width=True)
 
     # ── Drill-down tables ───────────────────────────────────────────────────
