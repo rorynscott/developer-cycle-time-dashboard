@@ -61,8 +61,8 @@ def read_watermark(conn, table, pipeline):
 
     Args:
         conn: SQLite connection
-        table: Watermark table name (e.g. 'etl_watermark', 'etl_watermark_jira')
-        pipeline: Pipeline name key (e.g. 'github_pr_etl', 'jira_etl')
+        table: Watermark table name (e.g. 'etl_watermark', 'etl_watermark_gh_issues')
+        pipeline: Pipeline name key (e.g. 'github_pr_etl', 'github_issues_etl')
     """
     cur = conn.execute(
         f"SELECT last_updated_since FROM {table} "

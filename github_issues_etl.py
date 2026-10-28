@@ -8,8 +8,11 @@ as the PR ETL. Issues are found by assignee — there is no other reliable
 marker of team ownership — and lifecycle timestamps come from Projects v2
 status-change events on the issue timeline.
 
-Every run re-syncs all team-assigned issues (it's a handful of GraphQL
-queries), so reassignments and status changes are always picked up.
+Issues are searched in the same repos the PR ETL tracks. Every run
+re-syncs all team-assigned issues (it's a handful of GraphQL queries), so
+reassignments and status changes are always picked up. The parent of every
+team issue (epic, deliverable, ...) is also fetched — whoever it's
+assigned to — so delivery can be rolled up per epic.
 
 Usage:
     python3 github_issues_etl.py                      # full sync
@@ -22,8 +25,6 @@ import sys
 import os
 import time
 import argparse
-import urllib.request
-import urllib.error
 from datetime import datetime, timezone
 
 # Add project root to path for lib imports
@@ -31,16 +32,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lib.config import (
     get_team_members, get_team_resolver, get_github_token,
-    get_github_issues_config, get_db_path,
+    get_github_issues_config, get_github_repo_config, get_db_path,
 )
 from lib.db import log, get_db_connection, with_db_retry, update_watermark
+from lib.github import graphql, resolve_repos
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
 ALL_TEAM_MEMBERS = get_team_members()
 TEAM_AT = get_team_resolver()
-
-GRAPHQL_URL = "https://api.github.com/graphql"
 
 SEARCH_QUERY = """
 query($q: String!, $cursor: String) {
@@ -88,30 +88,18 @@ query($q: String!, $cursor: String) {
 }
 """
 
+EPIC_FIELDS = """
+  number title url state stateReason createdAt closedAt
+  repository { nameWithOwner }
+  issueType { name }
+  subIssuesSummary { total completed }
+  parent { number title repository { nameWithOwner } }
+"""
+
+# Parents are fetched in batches of aliased lookups (one query per batch).
+EPIC_BATCH = 25
+
 # ── GitHub API ───────────────────────────────────────────────────────────────
-
-
-def graphql(token, query, variables, retries=3):
-    body = json.dumps({"query": query, "variables": variables}).encode()
-    for attempt in range(retries):
-        req = urllib.request.Request(GRAPHQL_URL, data=body, method="POST")
-        req.add_header("Authorization", f"Bearer {token}")
-        req.add_header("Content-Type", "application/json")
-        try:
-            with urllib.request.urlopen(req) as resp:
-                result = json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            if e.code in (403, 429, 502):
-                wait = 30 * (attempt + 1)
-                log(f"  GraphQL HTTP {e.code}, sleeping {wait}s... "
-                    f"(attempt {attempt + 1}/{retries})")
-                time.sleep(wait)
-                continue
-            raise
-        if result.get("errors"):
-            raise RuntimeError(f"GraphQL errors: {result['errors']}")
-        return result["data"]
-    raise RuntimeError("GraphQL: max retries exceeded")
 
 
 def search_issues(token, query_str):
@@ -127,6 +115,49 @@ def search_issues(token, query_str):
             return
         cursor = search["pageInfo"]["endCursor"]
         time.sleep(0.5)
+
+
+def fetch_epics(token, issue_keys):
+    """Return {issue_key: node} for the given org/repo#number keys.
+
+    Keys the token can't read (repos outside its scope, deleted issues)
+    are left out.
+    """
+    keys = sorted(issue_keys)
+    found = {}
+    for start in range(0, len(keys), EPIC_BATCH):
+        batch = keys[start:start + EPIC_BATCH]
+        parts = []
+        for i, key in enumerate(batch):
+            repo, number = key.split("#")
+            owner, name = repo.split("/")
+            parts.append(
+                f'e{i}: repository(owner: "{owner}", name: "{name}") '
+                f"{{ issue(number: {int(number)}) {{ {EPIC_FIELDS} }} }}"
+            )
+        try:
+            data = graphql(token, "query {" + "\n".join(parts) + "}", {})
+        except RuntimeError as e:
+            # One unreadable repo fails the whole batch; retry one by one so
+            # the rest still load.
+            if len(batch) == 1:
+                log(f"  WARNING: can't read parent {batch[0]}: {e}")
+                continue
+            found.update(fetch_epics_one_by_one(token, batch))
+            continue
+        for i, key in enumerate(batch):
+            node = (data.get(f"e{i}") or {}).get("issue")
+            if node:
+                found[key] = node
+        time.sleep(0.5)
+    return found
+
+
+def fetch_epics_one_by_one(token, keys):
+    found = {}
+    for key in keys:
+        found.update(fetch_epics(token, [key]))
+    return found
 
 
 # ── Transform ────────────────────────────────────────────────────────────────
@@ -264,6 +295,26 @@ DDL = [
         issues_processed    INTEGER
     )
     """,
+    # Parents of team issues (epics, deliverables, ...), whoever they're
+    # assigned to. children_* count every sub-issue, not just the team's.
+    """
+    CREATE TABLE IF NOT EXISTS dim_gh_epic (
+        issue_key           TEXT PRIMARY KEY,
+        repo_key            TEXT NOT NULL,
+        title               TEXT,
+        url                 TEXT,
+        issue_type          TEXT,
+        state               TEXT,
+        state_reason        TEXT,
+        created_at          TEXT,
+        closed_at           TEXT,
+        children_total      INTEGER,
+        children_completed  INTEGER,
+        parent_key          TEXT,
+        parent_title        TEXT,
+        etl_loaded_at       TEXT
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_gh_issue_team ON dim_gh_issue(team_name)",
     "CREATE INDEX IF NOT EXISTS idx_gh_issue_sc_key "
     "ON dim_gh_issue_status_change(issue_key)",
@@ -334,6 +385,47 @@ def upsert_issue(conn, rec, loaded_at):
     )
 
 
+def upsert_epic(conn, node, loaded_at):
+    parent = node.get("parent")
+    repo = node["repository"]["nameWithOwner"]
+    summary = node.get("subIssuesSummary") or {}
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO dim_gh_epic (
+            issue_key, repo_key, title, url, issue_type, state, state_reason,
+            created_at, closed_at, children_total, children_completed,
+            parent_key, parent_title, etl_loaded_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            f"{repo}#{node['number']}", repo, node["title"], node["url"],
+            (node.get("issueType") or {}).get("name"), node["state"],
+            node.get("stateReason"), node["createdAt"], node.get("closedAt"),
+            summary.get("total"), summary.get("completed"),
+            f"{parent['repository']['nameWithOwner']}#{parent['number']}"
+            if parent else None,
+            parent["title"] if parent else None,
+            loaded_at,
+        ),
+    )
+
+
+def repo_query_chunks(repos, reserve):
+    """Split repos into "repo:a repo:b" filters that fit GitHub's 256-char
+    search query limit, leaving ``reserve`` chars for the other qualifiers."""
+    chunks, current = [], ""
+    for repo in repos:
+        term = f"repo:{repo}"
+        if current and len(current) + 1 + len(term) > 256 - reserve:
+            chunks.append(current)
+            current = term
+        else:
+            current = f"{current} {term}".strip()
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 
@@ -355,27 +447,36 @@ def main():
     token = get_github_token()
     db_path = get_db_path()
     in_progress = {s.lower() for s in issues_cfg["in_progress_statuses"]}
-    repo_filter = " ".join(f"repo:{r}" for r in issues_cfg["repos"])
+    repos = resolve_repos(token, get_github_repo_config())
     since_filter = f" updated:>={args.since}" if args.since else ""
+    longest_login = max(len(m) for m in ALL_TEAM_MEMBERS)
+    repo_filters = repo_query_chunks(
+        repos, reserve=len(f" is:issue assignee:{since_filter}") + longest_login,
+    )
 
-    log(f"Repos: {', '.join(issues_cfg['repos'])}")
+    log(f"Repos: {', '.join(repos)}")
     log(f"Assignees: {len(ALL_TEAM_MEMBERS)} team members")
 
     # Search per assignee; an issue with two team assignees shows up twice,
     # so dedupe on issue_key.
     records = {}
     for member in sorted(ALL_TEAM_MEMBERS):
-        query_str = f"{repo_filter} is:issue assignee:{member}{since_filter}"
         n = 0
-        for node in search_issues(token, query_str):
-            rec = transform_issue(node, in_progress)
-            records[rec["issue_key"]] = rec
-            n += 1
+        for repo_filter in repo_filters:
+            query_str = f"{repo_filter} is:issue assignee:{member}{since_filter}"
+            for node in search_issues(token, query_str):
+                rec = transform_issue(node, in_progress)
+                records[rec["issue_key"]] = rec
+                n += 1
+            time.sleep(0.5)
         if args.verbose or n:
             log(f"  {member}: {n} issues")
-        time.sleep(0.5)
 
     log(f"Fetched {len(records)} unique issues")
+
+    parent_keys = {r["parent_key"] for r in records.values() if r["parent_key"]}
+    epics = fetch_epics(token, parent_keys)
+    log(f"Fetched {len(epics)} of {len(parent_keys)} parent issues")
 
     if args.dry_run:
         for rec in list(records.values())[:3]:
@@ -405,6 +506,9 @@ def main():
                                  (key,))
             if stale:
                 log(f"  Removed {len(stale)} issues no longer team-assigned")
+            conn.execute("DELETE FROM dim_gh_epic")
+        for node in epics.values():
+            upsert_epic(conn, node, loaded_at)
         reattribute_issues(conn)
         conn.commit()
     with_db_retry(_write)
@@ -423,6 +527,7 @@ def main():
     print(json.dumps({
         "status": "success", "issues_processed": len(records),
         "completed": closed, "with_in_progress": with_ip,
+        "parents": len(epics),
         "dry_run": args.dry_run, "db_path": db_path,
     }))
 

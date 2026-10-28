@@ -1,0 +1,24 @@
+# Magnetic (Cisco design system) light theme. Values are the Magnetic
+# light-theme tokens (libs/design-tokens/.../token-theme-light.json in
+# magnetic-common-design-system). Dark mode isn't offered: Magnetic's dark
+# charting colors don't pass the chart palette checks on a dark surface.
+
+[theme]
+base = "light"
+primaryColor = "#1d69cc"             # interact.bg.default
+backgroundColor = "#ffffff"          # base.bg.weak.default (card)
+secondaryBackgroundColor = "#f7f7f7" # base.bg.default (page)
+textColor = "#23282e"                # base.text.default
+linkColor = "#1d69cc"                # interact.bg.default
+borderColor = "#e1e4e8"              # base.border.default
+dataframeBorderColor = "#e1e4e8"
+dataframeHeaderBackgroundColor = "#f7f7f7"
+redColor = "#cc2d37"                 # negative.bg.default
+orangeColor = "#f26722"              # severe-warning
+yellowColor = "#cc8604"              # warning.bg.default
+blueColor = "#139beb"                # positive.bg.default (Magnetic positive is blue)
+violetColor = "#864ae0"              # info.bg.default
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap, sans-serif"
+headingFontWeights = [700, 600, 600, 600, 600, 600]
+baseRadius = "6px"
+showWidgetBorder = true

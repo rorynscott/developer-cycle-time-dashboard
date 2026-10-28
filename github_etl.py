@@ -6,8 +6,14 @@ Extracts pull request data from GitHub REST API and loads it into a local
 SQLite database. Captures PRs where team members are involved as author,
 reviewer, or requested reviewer.
 
+Repos are discovered from the token (every non-archived repo in
+[github] org it can read) unless [github] repos lists them explicitly. Each
+repo keeps its own watermark, so a newly visible repo is backfilled from
+[github] history_start on its first run. Each run also snapshots the
+members of every [[github.approval_gates]] team.
+
 Usage:
-    python3 github_etl.py                          # auto (since last run, or yesterday)
+    python3 github_etl.py                          # auto (each repo since its last sync)
     python3 github_etl.py --since 2026-01-01       # from a specific date
     python3 github_etl.py --since 2026-01-01 --until 2026-01-31  # date range
     python3 github_etl.py --dry-run --verbose      # preview without writing
@@ -20,31 +26,30 @@ import sys
 import os
 import re
 import time
-import sqlite3
 import argparse
-import urllib.request
-import urllib.error
-import urllib.parse
-from datetime import datetime, timezone, timedelta
+import sqlite3
+from datetime import datetime, timezone
 
 # Add project root to path for lib imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lib.config import (
-    load_config, get_team_lookup, get_team_members, get_team_resolver,
-    get_former_members,
-    get_github_token,
-    get_db_path,
+    get_team_lookup, get_team_members, get_team_resolver,
+    get_former_members, get_github_token, get_github_repo_config,
+    get_history_start, get_approval_gates, get_db_path,
 )
-from lib.db import log, is_error, get_db_connection, with_db_retry
+from lib.db import (
+    log, is_error, get_db_connection, with_db_retry, update_watermark,
+)
+from lib.github import (
+    API, github_api, paginate, resolve_repos, fetch_team_members,
+)
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
 TEAM_LOOKUP = get_team_lookup()
 ALL_TEAM_MEMBERS = get_team_members()
 TEAM_AT = get_team_resolver()
-
-JIRA_KEY_RE = re.compile(r"(?<![A-Za-z])([A-Z][A-Z0-9]+-\d+)(?=\b|[_/\s]|$)")
 
 AI_COAUTHOR_PATTERNS = [
     (re.compile(r"co-authored-by:.*\bclaude\b", re.IGNORECASE), "Claude"),
@@ -57,59 +62,24 @@ AI_COAUTHOR_PATTERNS = [
     (re.compile(r"co-authored-by:.*\bcursor\b", re.IGNORECASE), "Cursor"),
 ]
 
-# ── GitHub API helpers ───────────────────────────────────────────────────────
-
-
-def github_api(token, url, retries=3):
-    req = urllib.request.Request(url)
-    req.add_header("Authorization", f"Bearer {token}")
-    req.add_header("Accept", "application/vnd.github+json")
-    req.add_header("X-GitHub-Api-Version", "2022-11-28")
-    for attempt in range(retries):
-        try:
-            with urllib.request.urlopen(req) as resp:
-                remaining = resp.headers.get("X-RateLimit-Remaining")
-                if remaining and int(remaining) < 50:
-                    reset_ts = int(resp.headers.get("X-RateLimit-Reset", 0))
-                    wait = max(reset_ts - int(time.time()), 1)
-                    log(f"  Rate limit low ({remaining}), sleeping {wait}s...")
-                    time.sleep(wait)
-                return json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            if e.code in (403, 429):
-                reset_ts = int(e.headers.get("X-RateLimit-Reset", 0))
-                wait = max(reset_ts - int(time.time()), 5)
-                log(f"  Rate limited ({e.code}), sleeping {wait}s... "
-                    f"(attempt {attempt + 1}/{retries})")
-                time.sleep(wait)
-                continue
-            body = e.read().decode() if attempt == 0 else ""
-            if attempt == retries - 1:
-                return {"error": str(e), "status": e.code, "body": body}
-            time.sleep(2)
-    return {"error": "Max retries exceeded"}
-
-
 # ── GitHub data fetchers ─────────────────────────────────────────────────────
 
 
-def fetch_prs_page(token, repo, state="all", sort="updated", direction="desc",
-                   per_page=100, page=1):
-    url = (f"https://api.github.com/repos/{repo}/pulls"
-           f"?state={state}&sort={sort}&direction={direction}"
-           f"&per_page={per_page}&page={page}")
-    return github_api(token, url)
-
-
 def fetch_prs_in_range(token, repo, since_iso, until_iso=None):
-    """Fetch all PRs updated within the given date range."""
+    """Fetch all PRs updated within the given date range.
+
+    Raises on an API error: a partial page list would otherwise advance the
+    repo's watermark past PRs that were never fetched.
+    """
     all_prs = []
     page = 1
     while True:
-        result = fetch_prs_page(token, repo, page=page)
+        result = github_api(
+            token, f"{API}/repos/{repo}/pulls?state=all&sort=updated"
+                   f"&direction=desc&per_page=100&page={page}",
+        )
         if is_error(result):
-            log(f"  Error fetching PRs from {repo} page {page}: {result}")
-            break
+            raise RuntimeError(f"Fetching PRs from {repo} page {page}: {result}")
         if not result:
             break
         for pr in result:
@@ -138,65 +108,24 @@ def has_team_involvement(pr):
 
 
 def fetch_pr_detail(token, repo, number):
-    url = f"https://api.github.com/repos/{repo}/pulls/{number}"
-    result = github_api(token, url)
+    result = github_api(token, f"{API}/repos/{repo}/pulls/{number}")
     if is_error(result):
         return None
     return result
 
 
 def fetch_pr_reviews(token, repo, number):
-    all_reviews = []
-    page = 1
-    while True:
-        url = (f"https://api.github.com/repos/{repo}/pulls/{number}/reviews"
-               f"?per_page=100&page={page}")
-        result = github_api(token, url)
-        if is_error(result):
-            break
-        if not result:
-            break
-        all_reviews.extend(result)
-        if len(result) < 100:
-            break
-        page += 1
-    return all_reviews
+    return paginate(token, f"{API}/repos/{repo}/pulls/{number}/reviews")
 
 
 def fetch_issue_comments(token, repo, number):
-    all_comments = []
-    page = 1
-    while True:
-        url = (f"https://api.github.com/repos/{repo}/issues/{number}/comments"
-               f"?per_page=100&page={page}")
-        result = github_api(token, url)
-        if is_error(result):
-            break
-        if not result:
-            break
-        all_comments.extend(result)
-        if len(result) < 100:
-            break
-        page += 1
-    return all_comments
+    return paginate(token, f"{API}/repos/{repo}/issues/{number}/comments")
 
 
 def fetch_pr_commits(token, repo, number):
-    all_commits = []
-    page = 1
-    while True:
-        url = (f"https://api.github.com/repos/{repo}/pulls/{number}/commits"
-               f"?per_page=100&page={page}")
-        result = github_api(token, url)
-        if is_error(result):
-            break
-        if not result:
-            break
-        all_commits.extend(result)
-        if len(result) < 100 or page >= 3:
-            break
-        page += 1
-    return all_commits
+    # Commits only feed AI co-author detection; 300 is plenty.
+    return paginate(token, f"{API}/repos/{repo}/pulls/{number}/commits",
+                    max_pages=3)
 
 
 def reviews_have_team_member(reviews):
@@ -260,13 +189,6 @@ def detect_ai_coauthor(commits, pr_body=""):
         if pattern.search(full_text):
             tools_found.add(tool_name)
     return sorted(tools_found)
-
-
-def extract_jira_keys(title, head_branch, body=""):
-    """Extract Jira ticket keys from PR title, branch name, and body."""
-    originals = f"{title or ''} {head_branch or ''} {body or ''}"
-    keys = set(JIRA_KEY_RE.findall(originals))
-    return sorted(keys)
 
 
 def extract_reviewers(reviews):
@@ -353,9 +275,6 @@ def transform_pr(pr_list_item, detail, reviews, issue_comments, commits):
         ),
         "has_ai_coauthor": len(ai_tools) > 0,
         "ai_coauthor_tools": ",".join(ai_tools) if ai_tools else None,
-        "jira_keys": extract_jira_keys(
-            pr_list_item.get("title"), pr_list_item.get("head", {}).get("ref"), pr_body
-        ),
         "reviewers": json.dumps(extract_reviewers(reviews)),
         "review_status": compute_review_status(reviews),
     }
@@ -413,7 +332,6 @@ DDL_STATEMENTS = [
         total_lines_changed INTEGER,
         has_ai_coauthor     INTEGER,
         ai_coauthor_tools   TEXT,
-        jira_keys           TEXT,
         reviewers           TEXT,
         review_status       TEXT,
         etl_loaded_at       TEXT
@@ -427,11 +345,15 @@ DDL_STATEMENTS = [
         left_on         TEXT
     )
     """,
+    # is_active: the repo is currently tracked (visible to the token and not
+    # excluded). synced_through: per-repo watermark (ISO timestamp).
     """
     CREATE TABLE IF NOT EXISTS dim_repo (
-        repo_key    TEXT PRIMARY KEY,
-        repo_owner  TEXT,
-        repo_name   TEXT
+        repo_key        TEXT PRIMARY KEY,
+        repo_owner      TEXT,
+        repo_name       TEXT,
+        is_active       INTEGER DEFAULT 1,
+        synced_through  TEXT
     )
     """,
     """
@@ -442,6 +364,18 @@ DDL_STATEMENTS = [
         review_state    TEXT,
         submitted_at    TEXT,
         etl_loaded_at   TEXT
+    )
+    """,
+    # Approval-gate team membership, one row per (team, login). Teams have
+    # no membership history in the API, so first_seen/last_seen record
+    # which daily snapshots included the login.
+    """
+    CREATE TABLE IF NOT EXISTS dim_gate_member (
+        team_slug   TEXT NOT NULL,
+        login       TEXT NOT NULL,
+        first_seen  TEXT NOT NULL,
+        last_seen   TEXT NOT NULL,
+        PRIMARY KEY (team_slug, login)
     )
     """,
     """
@@ -459,14 +393,6 @@ DDL_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_fact_pr_team ON fact_pr(team_name)",
     "CREATE INDEX IF NOT EXISTS idx_dim_review_pr ON dim_review(pr_key)",
     "CREATE INDEX IF NOT EXISTS idx_dim_review_reviewer ON dim_review(reviewer_login)",
-    """
-    CREATE TABLE IF NOT EXISTS bridge_pr_jira (
-        pr_key      TEXT NOT NULL,
-        jira_key    TEXT NOT NULL,
-        PRIMARY KEY (pr_key, jira_key)
-    )
-    """,
-    "CREATE INDEX IF NOT EXISTS idx_bridge_pr_jira_jira ON bridge_pr_jira(jira_key)",
 ]
 
 
@@ -475,28 +401,40 @@ def ensure_tables(conn):
         conn.execute(ddl)
     # Migrations for existing databases
     cur = conn.execute("PRAGMA table_info(fact_pr)")
-    columns = {row[1] for row in cur.fetchall()}
-    if "jira_keys" not in columns:
-        conn.execute("ALTER TABLE fact_pr ADD COLUMN jira_keys TEXT")
-        log("  Migrated: added jira_keys column to fact_pr")
-    if "merged_by" not in columns:
+    if "merged_by" not in {row[1] for row in cur.fetchall()}:
         conn.execute("ALTER TABLE fact_pr ADD COLUMN merged_by TEXT")
         log("  Migrated: added merged_by column to fact_pr")
     cur = conn.execute("PRAGMA table_info(dim_author)")
     if "left_on" not in {row[1] for row in cur.fetchall()}:
         conn.execute("ALTER TABLE dim_author ADD COLUMN left_on TEXT")
         log("  Migrated: added left_on column to dim_author")
+    cur = conn.execute("PRAGMA table_info(dim_repo)")
+    repo_cols = {row[1] for row in cur.fetchall()}
+    if "synced_through" not in repo_cols:
+        conn.execute("ALTER TABLE dim_repo ADD COLUMN is_active INTEGER DEFAULT 1")
+        conn.execute("ALTER TABLE dim_repo ADD COLUMN synced_through TEXT")
+        # Repos synced under the old shared watermark carry it over, so
+        # switching to per-repo watermarks doesn't trigger a re-backfill.
+        row = conn.execute(
+            "SELECT last_updated_since FROM etl_watermark "
+            "WHERE pipeline_name = 'github_pr_etl'"
+        ).fetchone()
+        if row and row[0]:
+            conn.execute("UPDATE dim_repo SET synced_through = ?", (row[0],))
+        log("  Migrated: per-repo watermarks on dim_repo")
     conn.commit()
     log("  Tables ensured.")
 
 
-def seed_dimensions(conn):
-    cfg = load_config()
-    for repo in cfg["github"]["repos"]:
+def seed_dimensions(conn, repos):
+    """Mark exactly ``repos`` as tracked and (re)seed the team roster."""
+    conn.execute("UPDATE dim_repo SET is_active = 0")
+    for repo in repos:
         owner, name = repo.split("/")
         conn.execute(
-            "INSERT OR REPLACE INTO dim_repo (repo_key, repo_owner, repo_name) "
-            "VALUES (?, ?, ?)",
+            "INSERT INTO dim_repo (repo_key, repo_owner, repo_name, is_active) "
+            "VALUES (?, ?, ?, 1) "
+            "ON CONFLICT(repo_key) DO UPDATE SET is_active = 1",
             (repo, owner, name),
         )
     # Untrack anyone dropped from the roster entirely, then (re)seed current
@@ -518,6 +456,28 @@ def seed_dimensions(conn):
         )
     conn.commit()
     log("  Dimensions seeded.")
+
+
+def snapshot_gate_members(conn, token):
+    """Record today's membership of every approval-gate team."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    for gate in get_approval_gates():
+        org = gate["repo"].split("/")[0]
+        try:
+            members = fetch_team_members(token, org, gate["team"])
+        except RuntimeError as e:
+            # Needs org Members:read on the token. Keep going: PR data is
+            # still worth loading, and old snapshots stay usable.
+            log(f"  WARNING: can't read gate team {org}/{gate['team']}: {e}")
+            continue
+        conn.executemany(
+            "INSERT INTO dim_gate_member (team_slug, login, first_seen, last_seen) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(team_slug, login) DO UPDATE SET last_seen = excluded.last_seen",
+            [(gate["team"], m, today, today) for m in members],
+        )
+        log(f"  Gate {gate['team']}: {len(members)} members")
+    conn.commit()
 
 
 def reattribute_prs(conn):
@@ -553,13 +513,13 @@ def upsert_fact_pr(conn, record):
             hours_to_first_approval, hours_to_merge,
             review_comment_count, issue_comment_count, total_comment_count,
             files_changed, lines_added, lines_removed, total_lines_changed,
-            has_ai_coauthor, ai_coauthor_tools, jira_keys,
+            has_ai_coauthor, ai_coauthor_tools,
             reviewers, review_status,
             etl_loaded_at
         ) VALUES (
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?
+            ?, ?, ?
         )
         """,
         (
@@ -577,37 +537,10 @@ def upsert_fact_pr(conn, record):
             record["lines_removed"], record["total_lines_changed"],
             int(record["has_ai_coauthor"]),
             record["ai_coauthor_tools"],
-            json.dumps(record["jira_keys"]) if record["jira_keys"] else None,
             record["reviewers"],
             record["review_status"], now,
         ),
     )
-
-
-def backfill_merged_by(conn, token):
-    """Fill merged_by for merged PRs loaded before the column existed.
-
-    One detail call per PR. Resumable: only rows still NULL are fetched.
-    """
-    rows = conn.execute(
-        "SELECT pr_key, repo_key, pr_number FROM fact_pr "
-        "WHERE merged_at IS NOT NULL AND merged_by IS NULL "
-        "ORDER BY merged_at DESC"
-    ).fetchall()
-    log(f"Backfilling merged_by for {len(rows)} merged PRs...")
-    for i, (pr_key, repo, number) in enumerate(rows, 1):
-        detail = fetch_pr_detail(token, repo, number)
-        login = ((detail or {}).get("merged_by") or {}).get("login")
-        if login:
-            with_db_retry(lambda: conn.execute(
-                "UPDATE fact_pr SET merged_by = ? WHERE pr_key = ?",
-                (login, pr_key),
-            ))
-        if i % 100 == 0:
-            with_db_retry(conn.commit)
-            log(f"  {i}/{len(rows)}")
-    with_db_retry(conn.commit)
-    log("  merged_by backfill done.")
 
 
 def upsert_dim_reviews(conn, pr_key, review_records):
@@ -625,176 +558,191 @@ def upsert_dim_reviews(conn, pr_key, review_records):
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 
+def sync_repo(token, repo, since_iso, until_iso, args, db_conn):
+    """Load every team-involved PR in ``repo`` updated in the range.
+
+    Returns (processed, skipped).
+    """
+    prs = fetch_prs_in_range(token, repo, since_iso, until_iso)
+    log(f"  Found {len(prs)} PRs in date range")
+
+    # Phase 1: quick filter by author / requested reviewers
+    if args.all_authors:
+        candidates = prs
+    else:
+        candidates = [pr for pr in prs if has_team_involvement(pr)]
+        log(f"  {len(candidates)} have team involvement "
+            f"(author or requested reviewer), {len(prs) - len(candidates)} skipped")
+
+        # Phase 2: for remaining PRs, fetch reviews to catch team reviewers
+        candidate_numbers = {pr["number"] for pr in candidates}
+        remaining = [pr for pr in prs if pr["number"] not in candidate_numbers]
+        if remaining:
+            log(f"  Checking {len(remaining)} remaining PRs for team reviewers...")
+            for pr in remaining:
+                if reviews_have_team_member(fetch_pr_reviews(token, repo, pr["number"])):
+                    candidates.append(pr)
+                time.sleep(0.1)
+            log(f"  After review check: {len(candidates)} PRs with team involvement")
+
+    log(f"  Enriching {len(candidates)} PRs...")
+
+    for i, pr in enumerate(candidates):
+        number = pr["number"]
+        author = (pr.get("user") or {}).get("login", "")
+
+        if args.verbose:
+            log(f"  [{i+1}/{len(candidates)}] PR #{number} by {author}")
+
+        detail = fetch_pr_detail(token, repo, number)
+        reviews = fetch_pr_reviews(token, repo, number)
+        issue_comments = fetch_issue_comments(token, repo, number)
+        commits = fetch_pr_commits(token, repo, number)
+
+        record = transform_pr(pr, detail, reviews, issue_comments, commits)
+        review_records = transform_reviews(record["pr_key"], reviews)
+
+        if args.dry_run:
+            if args.verbose or i < 3:
+                print(json.dumps(record, indent=2, default=str))
+        else:
+            def _write_pr():
+                upsert_fact_pr(db_conn, record)
+                upsert_dim_reviews(db_conn, record["pr_key"], review_records)
+                if author not in TEAM_LOOKUP:
+                    db_conn.execute(
+                        "INSERT OR IGNORE INTO dim_author "
+                        "(author_login, team_name, is_tracked) "
+                        "VALUES (?, NULL, 0)",
+                        (author,),
+                    )
+            with_db_retry(_write_pr)
+
+            if (i + 1) % 50 == 0:
+                with_db_retry(db_conn.commit)
+
+        time.sleep(0.25)
+
+        if (i + 1) % 50 == 0:
+            log(f"  Progress: {i+1}/{len(candidates)} PRs enriched")
+
+    return len(candidates), len(prs) - len(candidates)
+
+
 def main():
     parser = argparse.ArgumentParser(description="GitHub PR ETL to SQLite")
     parser.add_argument("--since", type=str,
-                        help="Start date (YYYY-MM-DD). Overrides watermark.")
+                        help="Start date (YYYY-MM-DD) for every repo. "
+                             "Overrides the per-repo watermarks.")
     parser.add_argument("--until", type=str,
-                        help="End date (YYYY-MM-DD). Defaults to now.")
+                        help="End date (YYYY-MM-DD). Defaults to now; "
+                             "a bounded run doesn't advance watermarks.")
     parser.add_argument("--repos", type=str,
-                        help="Comma-separated repo subset (org/repo); "
-                             "does not advance the watermark")
+                        help="Comma-separated repo subset (org/repo)")
+    parser.add_argument("--list-repos", action="store_true",
+                        help="Print the repos that would be tracked, then exit")
     parser.add_argument("--dry-run", action="store_true",
                         help="Extract and transform only, no DB writes")
     parser.add_argument("--all-authors", action="store_true",
                         help="Include all authors (default: team involvement only)")
     parser.add_argument("--verbose", action="store_true",
                         help="Extra logging")
-    parser.add_argument("--backfill-merged-by", action="store_true",
-                        help="Fill merged_by for already-loaded merged PRs, "
-                             "then exit")
     args = parser.parse_args()
 
-    cfg = load_config()
     gh_token = get_github_token()
     db_path = get_db_path()
-    repos = cfg["github"]["repos"]
+    tracked = resolve_repos(gh_token, get_github_repo_config())
+    log(f"Tracking {len(tracked)} repos: {', '.join(tracked)}")
+    if args.list_repos:
+        print("\n".join(tracked))
+        return
+    repos = tracked
     if args.repos:
         repos = [r.strip() for r in args.repos.split(",") if r.strip()]
 
-    # Set up DB
     db_conn = None
+    watermarks = {}
     if not args.dry_run:
         db_conn = get_db_connection(db_path)
         ensure_tables(db_conn)
-        seed_dimensions(db_conn)
+        seed_dimensions(db_conn, tracked)
+        snapshot_gate_members(db_conn, gh_token)
         reattribute_prs(db_conn)
-        if args.backfill_merged_by:
-            backfill_merged_by(db_conn, gh_token)
-            db_conn.close()
-            return
+        watermarks = dict(db_conn.execute(
+            "SELECT repo_key, synced_through FROM dim_repo"
+        ).fetchall())
+    elif os.path.exists(db_path):
+        # Dry run: read existing watermarks so it previews a normal run,
+        # not a full backfill of every repo
+        conn = get_db_connection(db_path)
+        try:
+            watermarks = dict(conn.execute(
+                "SELECT repo_key, synced_through FROM dim_repo"
+            ).fetchall())
+        except sqlite3.OperationalError:  # pre-migration DB, no synced_through
+            pass
+        conn.close()
 
-    # Determine date range
-    if args.since:
-        since_iso = f"{args.since}T00:00:00Z"
-    elif db_conn:
-        from lib.db import read_watermark
-        since_iso = read_watermark(db_conn, "etl_watermark", "github_pr_etl")
-    else:
-        since_iso = None
-
-    if not since_iso:
-        since_dt = datetime.now(timezone.utc) - timedelta(days=1)
-        since_iso = since_dt.strftime("%Y-%m-%dT00:00:00Z")
-        log("No watermark found, defaulting to yesterday")
-
-    until_iso = None
-    if args.until:
-        until_iso = f"{args.until}T23:59:59Z"
-
-    log(f"Date range: {since_iso}" + (f" to {until_iso}" if until_iso else " to now"))
+    until_iso = f"{args.until}T23:59:59Z" if args.until else None
+    history_start = f"{get_history_start()}T00:00:00Z"
 
     total_processed = 0
     total_skipped = 0
-    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    failed = []
+    run_started = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     for repo in repos:
-        log(f"\nProcessing {repo}...")
-        prs = fetch_prs_in_range(gh_token, repo, since_iso, until_iso)
-        log(f"  Found {len(prs)} PRs in date range")
-
-        # Phase 1: quick filter by author / requested reviewers
-        if args.all_authors:
-            candidates = prs
+        prior = watermarks.get(repo)
+        if args.since:
+            since_iso = f"{args.since}T00:00:00Z"
         else:
-            candidates = []
-            for pr in prs:
-                if has_team_involvement(pr):
-                    candidates.append(pr)
-            log(f"  {len(candidates)} have team involvement "
-                f"(author or requested reviewer), {len(prs) - len(candidates)} skipped")
+            # Never synced: backfill from history_start
+            since_iso = prior or history_start
+        log(f"\nProcessing {repo} (since {since_iso})...")
+        try:
+            processed, skipped = sync_repo(
+                gh_token, repo, since_iso, until_iso, args, db_conn,
+            )
+        except RuntimeError as e:
+            # Leave this repo's watermark alone so the next run retries it
+            log(f"  ERROR: {repo} failed, watermark not advanced: {e}")
+            failed.append(repo)
+            continue
+        total_processed += processed
+        total_skipped += skipped
 
-        # Phase 2: for remaining PRs, fetch reviews to catch team reviewers
-        if not args.all_authors:
-            candidate_numbers = {pr["number"] for pr in candidates}
-            remaining = [pr for pr in prs if pr["number"] not in candidate_numbers]
-            if remaining:
-                log(f"  Checking {len(remaining)} remaining PRs for team reviewers...")
-                for pr in remaining:
-                    reviews = fetch_pr_reviews(gh_token, repo, pr["number"])
-                    if reviews_have_team_member(reviews):
-                        candidates.append(pr)
-                    time.sleep(0.1)
-                log(f"  After review check: {len(candidates)} PRs with team involvement")
+        # Advance only when the run covered everything since the old
+        # watermark up to now (no --until, and --since not after it).
+        covers_gap = prior is None or since_iso <= prior
+        if db_conn and not until_iso and covers_gap:
+            with_db_retry(lambda: db_conn.execute(
+                "UPDATE dim_repo SET synced_through = ? WHERE repo_key = ?",
+                (run_started, repo),
+            ))
+        if db_conn:
+            with_db_retry(db_conn.commit)
 
-        log(f"  Enriching {len(candidates)} PRs...")
-
-        for i, pr in enumerate(candidates):
-            number = pr["number"]
-            author = (pr.get("user") or {}).get("login", "")
-
-            if args.verbose:
-                log(f"  [{i+1}/{len(candidates)}] PR #{number} by {author}")
-
-            detail = fetch_pr_detail(gh_token, repo, number)
-            reviews = fetch_pr_reviews(gh_token, repo, number)
-            issue_comments = fetch_issue_comments(gh_token, repo, number)
-            commits = fetch_pr_commits(gh_token, repo, number)
-
-            record = transform_pr(pr, detail, reviews, issue_comments, commits)
-            review_records = transform_reviews(record["pr_key"], reviews)
-
-            if args.dry_run:
-                if args.verbose or total_processed < 3:
-                    print(json.dumps(record, indent=2, default=str))
-            else:
-                def _write_pr():
-                    upsert_fact_pr(db_conn, record)
-                    upsert_dim_reviews(db_conn, record["pr_key"], review_records)
-                    db_conn.execute(
-                        "DELETE FROM bridge_pr_jira WHERE pr_key = ?",
-                        (record["pr_key"],),
-                    )
-                    for jk in record["jira_keys"]:
-                        db_conn.execute(
-                            "INSERT INTO bridge_pr_jira (pr_key, jira_key) "
-                            "VALUES (?, ?)",
-                            (record["pr_key"], jk),
-                        )
-                    if author not in TEAM_LOOKUP:
-                        db_conn.execute(
-                            "INSERT OR IGNORE INTO dim_author "
-                            "(author_login, team_name, is_tracked) "
-                            "VALUES (?, NULL, 0)",
-                            (author,),
-                        )
-                with_db_retry(_write_pr)
-
-                if (total_processed + 1) % 50 == 0:
-                    with_db_retry(db_conn.commit)
-
-            total_processed += 1
-            time.sleep(0.25)
-
-            if (i + 1) % 50 == 0:
-                log(f"  Progress: {i+1}/{len(candidates)} PRs enriched")
-
-        total_skipped += len(prs) - len(candidates)
-
-    if db_conn and not args.dry_run:
-        from lib.db import update_watermark
-        with_db_retry(db_conn.commit)
-    # A repo-subset run leaves the other repos unsynced, so the shared
-    # watermark must not move forward.
-    if db_conn and not args.dry_run and not args.repos:
+    if db_conn:
+        # Run-level record, shown as "last updated" on the dashboard
         with_db_retry(lambda: update_watermark(
             db_conn, "etl_watermark", "github_pr_etl",
-            now_iso, total_processed, "prs_processed",
+            run_started, total_processed, "prs_processed",
         ))
-    if db_conn:
         db_conn.close()
 
     log(f"\nDone. Processed {total_processed} PRs, skipped {total_skipped}.")
     log(f"Database: {db_path}")
     print(json.dumps({
-        "status": "success",
+        "status": "failed" if failed else "success",
         "prs_processed": total_processed,
         "prs_skipped": total_skipped,
-        "since": since_iso,
+        "failed_repos": failed,
         "until": until_iso,
         "dry_run": args.dry_run,
         "db_path": db_path,
     }))
+    if failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

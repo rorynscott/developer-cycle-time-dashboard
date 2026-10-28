@@ -1,10 +1,11 @@
 """
-ETL Logs — view GitHub and Jira ETL run history, errors, and recent output.
+ETL Logs — view GitHub PR and Issues ETL run history, errors, and recent output.
 """
 
 import os
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import streamlit as st
 
@@ -13,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from lib.config import get_log_dir
 
 LOG_DIR = get_log_dir()
-ET = timezone(timedelta(hours=-4))
+ET = ZoneInfo("America/New_York")
 
 ETL_CONFIGS = [
     {
@@ -25,26 +26,6 @@ ETL_CONFIGS = [
         "name": "GitHub Issues ETL",
         "log_file": os.path.join(LOG_DIR, "github_issues_etl.log"),
         "error_file": os.path.join(LOG_DIR, "github_issues_etl_errors.log"),
-    },
-    {
-        "name": "Jira ETL",
-        "log_file": os.path.join(LOG_DIR, "jira_etl.log"),
-        "error_file": os.path.join(LOG_DIR, "jira_etl_errors.log"),
-    },
-    {
-        "name": "Webex ETL",
-        "log_file": os.path.join(LOG_DIR, "webex_etl.log"),
-        "error_file": os.path.join(LOG_DIR, "webex_etl_errors.log"),
-    },
-    {
-        "name": "VictorOps ETL",
-        "log_file": os.path.join(LOG_DIR, "victorops_etl.log"),
-        "error_file": os.path.join(LOG_DIR, "victorops_etl_errors.log"),
-    },
-    {
-        "name": "FireHydrant ETL",
-        "log_file": os.path.join(LOG_DIR, "firehydrant_etl.log"),
-        "error_file": os.path.join(LOG_DIR, "firehydrant_etl_errors.log"),
     },
 ]
 
